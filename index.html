@@ -1,0 +1,234 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#F2F2F7">
+<title>错题本 · 拍 录 做 批 斩</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%23007AFF'/%3E%3Ctext x='32' y='45' font-size='36' text-anchor='middle' fill='white' font-family='sans-serif'%3E%E9%94%99%3C/text%3E%3C/svg%3E">
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+
+<div class="app">
+
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo">错</span>
+      <div>
+        <h1 id="pageTitle">今天</h1>
+        <p id="pageSub">拍 · 录 · 做 · 批 · 斩</p>
+      </div>
+    </div>
+    <button class="icon-btn" id="btnQuickAdd" title="拍照录题" aria-label="拍照录题">
+      <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M3 8.5A2.5 2.5 0 0 1 5.5 6h1.7l1.1-1.7h7.4L16.8 6h1.7A2.5 2.5 0 0 1 21 8.5v8A2.5 2.5 0 0 1 18.5 19h-13A2.5 2.5 0 0 1 3 16.5z"/>
+        <circle cx="12" cy="12.4" r="3.3"/>
+      </svg>
+    </button>
+  </header>
+
+  <main id="main">
+
+    <!-- 今天 -->
+    <section class="view" id="view-today">
+      <div id="todayHero"></div>
+      <div id="todayList"></div>
+      <div class="footnote" id="todayFoot"></div>
+    </section>
+
+    <!-- 录题 -->
+    <section class="view" id="view-add" hidden>
+
+      <div class="seg addmode" id="addMode">
+        <button type="button" data-mode="single" class="on">单题录入</button>
+        <button type="button" data-mode="batch">整页切题</button>
+      </div>
+
+      <div id="singleWrap">
+      <div class="uploader" id="uploader">
+        <input type="file" id="fileInput" accept="image/*" hidden>
+        <input type="file" id="camInput" accept="image/*" capture="environment" hidden>
+        <div class="up-empty" id="upEmpty">
+          <div class="up-icon">
+            <svg viewBox="0 0 24 24" width="30" height="30" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M12 16V4"/><path d="M7.5 8.5 12 4l4.5 4.5"/><path d="M4 15v3.5A1.5 1.5 0 0 0 5.5 20h13a1.5 1.5 0 0 0 1.5-1.5V15"/>
+            </svg>
+          </div>
+          <p class="up-title">拍照 / 截图 / 从相册选</p>
+          <p class="up-hint">也可以直接按 Ctrl+V 粘贴截图，或把图片拖进来</p>
+          <div class="up-actions">
+            <button class="btn btn-primary" id="btnCam">拍照</button>
+            <button class="btn btn-ghost" id="btnPick">从相册选</button>
+          </div>
+        </div>
+        <div class="up-preview" id="upPreview" hidden>
+          <img id="previewImg" alt="题目预览">
+          <div class="up-tools">
+            <button class="btn btn-sm btn-ghost" id="btnReplace">换一张</button>
+            <button class="btn btn-sm btn-danger-ghost" id="btnDrop">移除</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="ai-bar" id="aiBar">
+        <div class="ai-bar-l">
+          <span class="dot" id="aiDot"></span>
+          <span id="aiState">未配置大模型，先手动录入</span>
+        </div>
+        <button class="btn btn-sm btn-ai" id="btnRecognize">自动识别</button>
+      </div>
+
+      <form id="addForm" class="form" autocomplete="off">
+        <div class="field">
+          <label>学科</label>
+          <div class="chips" id="subjectChips"></div>
+        </div>
+        <div class="field">
+          <label>知识点 <span class="req">必填</span></label>
+          <input id="fKnowledge" list="knowledgeList" placeholder="如：分式方程增根 / 凸透镜成像">
+          <datalist id="knowledgeList"></datalist>
+        </div>
+        <div class="field">
+          <label>错因码 <span class="hint">只选一个主因</span></label>
+          <div class="chips chips-code" id="codeChips"></div>
+        </div>
+        <div class="field field-row">
+          <div>
+            <label>难度</label>
+            <div class="seg" id="diffSeg">
+              <button type="button" data-v="1">易</button>
+              <button type="button" data-v="2" class="on">中</button>
+              <button type="button" data-v="3">难</button>
+            </div>
+          </div>
+          <div>
+            <label>来源</label>
+            <input id="fSource" placeholder="如：期中卷">
+          </div>
+        </div>
+        <div class="field">
+          <label>题干文本 <span class="hint">识别后自动填，也可手打；有文本才能出变式题</span></label>
+          <textarea id="fStem" rows="3" placeholder="粘贴或输入题干（可选）"></textarea>
+        </div>
+        <div class="field">
+          <label>正确解法 / 关键一步 <span class="hint">斩题前要能讲清，就靠这一栏</span></label>
+          <textarea id="fNote" rows="3" placeholder="卡住我的是：＿＿＿＿&#10;下次先想：＿＿＿＿"></textarea>
+        </div>
+        <button type="submit" class="btn btn-primary btn-block" id="btnSave">存入题库</button>
+      </form>
+      </div><!-- /singleWrap -->
+
+      <!-- ===== 整页切题 ===== -->
+      <div id="batchWrap" hidden>
+
+        <div class="uploader" id="bUploader">
+          <input type="file" id="bFile" accept="image/*" hidden>
+          <input type="file" id="bCam" accept="image/*" capture="environment" hidden>
+          <div class="up-empty" id="bEmpty">
+            <div class="up-icon">
+              <svg viewBox="0 0 24 24" width="30" height="30" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+                <rect x="3.5" y="3.5" width="17" height="17" rx="2.5"/><path d="M3.5 9h17M3.5 15h17"/>
+              </svg>
+            </div>
+            <p class="up-title">拍一页，切成多题</p>
+            <p class="up-hint">整页卷子只拍一次。系统按题目之间的空白自动切分，切多了、切少了都能手动调</p>
+            <div class="up-actions">
+              <button class="btn btn-primary" id="bBtnCam">拍整页</button>
+              <button class="btn btn-ghost" id="bBtnPick">从相册选</button>
+            </div>
+          </div>
+          <div class="up-preview" id="bPreview" hidden>
+            <img id="bImg" alt="整页预览">
+          </div>
+        </div>
+
+        <div class="up-tools" id="bTools" hidden>
+          <button class="btn btn-sm btn-ghost" id="bReplace">换一页</button>
+          <button class="btn btn-sm btn-danger-ghost" id="bDrop">移除整页</button>
+        </div>
+
+        <div id="cropWrap" hidden>
+          <div class="crop-stage" id="cropStage">
+            <div class="crop-inner" id="cropInner">
+              <img id="cropImg" alt="切题预览">
+              <div class="crop-layer" id="cropLayer"></div>
+            </div>
+          </div>
+          <p class="crop-hint">点某一块可在该处再切一刀 · 拖动块之间的横线调整边界 · 点 × 把这块并到下一块</p>
+          <div class="btn-row">
+            <button class="btn btn-ghost btn-sm" id="btnAutoSeg">重新自动切</button>
+            <button class="btn btn-ghost btn-sm" id="btnAiSeg">AI 切题</button>
+          </div>
+          <button class="btn btn-primary btn-block" id="btnToItems">下一步：逐题确认</button>
+        </div>
+
+        <div id="batchItems" hidden></div>
+      </div>
+
+    </section>
+
+    <!-- 题库 -->
+    <section class="view" id="view-bank" hidden>
+      <div id="bankFilters"></div>
+      <div id="bankList"></div>
+    </section>
+
+    <!-- 统计 -->
+    <section class="view" id="view-stats" hidden>
+      <div id="statsBody"></div>
+    </section>
+
+    <!-- 设置 -->
+    <section class="view" id="view-settings" hidden>
+      <div id="settingsBody"></div>
+    </section>
+
+    <!-- 重做 -->
+    <section class="view" id="view-redo" hidden>
+      <div id="redoBody"></div>
+    </section>
+
+  </main>
+
+  <nav class="tabbar" id="tabbar">
+    <button data-view="today" class="on">
+      <svg viewBox="0 0 24 24" width="21" height="21" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 11.2 12 4.5l8 6.7V19a1.5 1.5 0 0 1-1.5 1.5h-4v-6h-5v6h-4A1.5 1.5 0 0 1 4 19z"/></svg>
+      <span>今天</span>
+    </button>
+    <button data-view="add">
+      <svg viewBox="0 0 24 24" width="21" height="21" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14"/><path d="M5 12h14"/></svg>
+      <span>录题</span>
+    </button>
+    <button data-view="bank">
+      <svg viewBox="0 0 24 24" width="21" height="21" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="4" width="16" height="16" rx="2.5"/><path d="M8 9.5h8M8 14.5h5"/></svg>
+      <span>题库</span>
+    </button>
+    <button data-view="stats">
+      <svg viewBox="0 0 24 24" width="21" height="21" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M5 19V11"/><path d="M12 19V5"/><path d="M19 19v-5"/></svg>
+      <span>统计</span>
+    </button>
+    <button data-view="settings">
+      <svg viewBox="0 0 24 24" width="21" height="21" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.6 1.6 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.6 1.6 0 0 0-1.8-.3 1.6 1.6 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1A1.6 1.6 0 0 0 9 19.4a1.6 1.6 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.6 1.6 0 0 0 .3-1.8 1.6 1.6 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1A1.6 1.6 0 0 0 4.6 9a1.6 1.6 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.6 1.6 0 0 0 1.8.3H9a1.6 1.6 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.6 1.6 0 0 0 1 1.5 1.6 1.6 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.6 1.6 0 0 0-.3 1.8V9a1.6 1.6 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.6 1.6 0 0 0-1.5 1z"/></svg>
+      <span>设置</span>
+    </button>
+  </nav>
+
+</div>
+
+<div class="sheet-host" id="sheetHost" hidden>
+  <div class="sheet-mask" id="sheetMask"></div>
+  <div class="sheet" id="sheet"></div>
+</div>
+
+<div id="toast" class="toast" hidden></div>
+
+<!-- 导出 PDF 的打印层（平时隐藏，打印时只输出这一块） -->
+<div id="printRoot" class="pv"></div>
+
+<script src="js/db.js"></script>
+<script src="js/app.js"></script>
+<script src="js/batch.js"></script>
+<script src="js/pdf.js"></script>
+</body>
+</html>
