@@ -245,7 +245,7 @@
       S.codes = r[2] || DEF_CODES.slice();
       S.knowledge = r[3] || JSON.parse(JSON.stringify(DEF_KNOWLEDGE));
       S.settings = Object.assign({}, DEF_SETTINGS, r[4] || {});
-      S.meta = Object.assign({ lastBackupAt: 0, hintSnoozeUntil: 0 }, r[5] || {});
+      S.meta = Object.assign({ lastBackupAt: 0, hintSnoozeUntil: 0, onboardedAt: 0 }, r[5] || {});
       // 首次写入默认值
       var jobs = [];
       if (!r[1]) jobs.push(Store.kvSet(LS_KEYS.subjects, S.subjects));
@@ -421,12 +421,19 @@
     $('#todayHero').innerHTML = hero;
 
     var body = '';
-    if (!shown.length) {
+    if (!shown.length && !S.questions.length) {
+      body = '<div class="empty"><div class="ico">＋</div><p>还没有一道错题</p>' +
+        '<small>拍下今天卷子上做错的那道题，它明天就会出现在这里</small>' +
+        '<div class="btn-row" style="max-width:280px;margin:14px auto 0">' +
+        '<button class="btn btn-primary btn-sm" id="emptyAdd">拍第一道</button>' +
+        '<button class="btn btn-ghost btn-sm" id="emptyHow">怎么用</button>' +
+        '</div></div>';
+    } else if (!shown.length) {
       body = '<div class="empty"><div class="ico">✓</div><p>今天没有待重做的题</p>' +
-        '<small>去拍一道今天卷子上的错题，或者载入示例看看怎么用</small>' +
+        '<small>去拍一道今天卷子上的错题，两分钟就能上手</small>' +
         '<div class="btn-row" style="max-width:280px;margin:14px auto 0">' +
         '<button class="btn btn-primary btn-sm" id="emptyAdd">拍题</button>' +
-        '<button class="btn btn-ghost btn-sm" id="emptyDemo">载入示例</button>' +
+        '<button class="btn btn-ghost btn-sm" id="emptyHow">怎么用</button>' +
         '</div></div>';
     } else {
       body = '<div class="block-title"><h2>待重做</h2><span class="side">按错得多排序</span></div>';
@@ -444,8 +451,8 @@
     if (b2) b2.onclick = function () { go('add'); };
     var b3 = $('#emptyAdd');
     if (b3) b3.onclick = function () { go('add'); };
-    var b4 = $('#emptyDemo');
-    if (b4) b4.onclick = loadDemo;
+    var b4 = $('#emptyHow');
+    if (b4) b4.onclick = openOnboarding;
     var b5 = $('#btnBackupNow');
     if (b5) b5.onclick = function () { exportData(); };
     var b6 = $('#btnBackupLater');
@@ -1046,6 +1053,40 @@
     document.body.style.overflow = '';
   }
 
+  /* ============ 首次打开：三步用法 ============ */
+  function markOnboarded() {
+    if (S.meta.onboardedAt) return;
+    S.meta.onboardedAt = Date.now();
+    saveMeta();
+  }
+
+  function openOnboarding() {
+    openSheet(
+      '<div class="onb">' +
+      '<h3 class="onb-t">三步就能用起来</h3>' +
+      '<p class="onb-sub">这个本子只干一件事：把做错的题，隔几天再让你做一遍。</p>' +
+      '<ol class="onb-list">' +
+      '<li><b>拍</b><span>点「拍题录入」拍一张错题。一张卷子有好几道题，就切到<em class="k">整页切题</em>，它会按题目之间的空白自动切开；切错能拖动边界、也能合并。</span></li>' +
+      '<li><b>做</b><span>首页每天推 <em class="k">3 道</em>该重做的题。在纸上自己做，别先看答案，做完再判对错。</span></li>' +
+      '<li><b>斩</b><span>判错 → 明天再来，错到第二次自动标<em class="k">反复错</em>；<em class="k">连对两次、间隔满 3 天</em>，才允许把这道题斩掉。</span></li>' +
+      '</ol>' +
+      '<div class="onb-note">题只存在这台设备上。换手机、清缓存都会没，顶栏那个下载图标随时能存一份备份。</div>' +
+      '<div class="onb-actions">' +
+      '<button class="btn btn-primary btn-block" id="onbAdd">好，拍第一道题</button>' +
+      '<div class="onb-row">' +
+      '<button class="btn btn-ghost btn-sm" id="onbDemo">先看看示例</button>' +
+      '<button class="btn btn-ghost btn-sm" id="onbDone">我自己摸索</button>' +
+      '</div>' +
+      '</div></div>'
+    );
+    var a = $('#onbAdd');
+    if (a) a.onclick = function () { markOnboarded(); closeSheet(); go('add'); };
+    var d = $('#onbDemo');
+    if (d) d.onclick = function () { markOnboarded(); closeSheet(); loadDemo(); };
+    var k = $('#onbDone');
+    if (k) k.onclick = function () { markOnboarded(); closeSheet(); };
+  }
+
   /* ============ 通用刷新 ============ */
   function refreshAll() {
     if (S.view === 'today') renderToday();
@@ -1375,6 +1416,11 @@
         console.warn('IndexedDB 不可用，已降级到 localStorage');
       }
       go('today');
+      // 第一次打开：题库为空就自动弹三步用法；老用户只做标记，不打扰
+      if (!S.meta.onboardedAt) {
+        if (!S.questions.length) setTimeout(openOnboarding, 320);
+        else { S.meta.onboardedAt = Date.now(); saveMeta(); }
+      }
     }).catch(function (e) {
       document.body.insertAdjacentHTML('afterbegin',
         '<div style="padding:14px;background:#FFEBEA;color:#D70015;font-size:13px">初始化失败：' + esc(e.message) + '</div>');
@@ -1400,7 +1446,8 @@
     imagePart: imagePart,
     extractJSON: extractJSON,
     openSheet: openSheet,
-    closeSheet: closeSheet
+    closeSheet: closeSheet,
+    openOnboarding: openOnboarding
   };
 
   // 暴露给调试
