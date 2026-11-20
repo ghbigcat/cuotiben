@@ -716,3 +716,28 @@ body.pv-open{overflow:hidden}
 .card-backup .bk-t{font-size:15.5px;font-weight:600;letter-spacing:-.2px}
 .card-backup .bk-d{font-size:12px;color:var(--muted);margin:6px 0 13px;line-height:1.6}
 .card-backup .btn-row{margin-top:9px}
+
+/* ---------- 首次打开：三步用法 ---------- */
+.onb{padding:2px 2px 4px;letter-spacing:0}
+.onb-t{margin:0 0 5px;font-size:19px;font-weight:700;letter-spacing:-.35px}
+.onb-sub{margin:0 0 18px;font-size:12.5px;color:var(--muted);line-height:1.6}
+.onb-list{list-style:none;margin:0 0 16px;padding:0;counter-reset:onb}
+.onb-list li{position:relative;padding-left:38px;margin-bottom:15px;counter-increment:onb}
+.onb-list li::before{
+  content:counter(onb);
+  position:absolute;left:0;top:1px;
+  width:26px;height:26px;border-radius:50%;
+  background:var(--pri);color:#fff;
+  font:600 13px/26px -apple-system,"SF Pro Text","PingFang SC",sans-serif;
+  text-align:center;
+}
+.onb-list li>b{display:block;font-size:14.5px;font-weight:600;margin-bottom:3px;letter-spacing:-.2px}
+.onb-list li>span{display:block;font-size:12.5px;line-height:1.66;color:var(--muted)}
+.onb-list em.k{font-style:normal;color:var(--txt-2);font-weight:600}
+.onb-note{
+  font-size:11.5px;line-height:1.65;color:var(--warn-ink);
+  background:var(--warn-soft);border-radius:10px;padding:9px 11px;margin-bottom:18px;
+}
+.onb-actions{padding-bottom:2px}
+.onb-row{display:flex;gap:9px;margin-top:9px}
+.onb-row .btn{flex:1 1 0;min-width:0;white-space:nowrap}
