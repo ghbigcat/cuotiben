@@ -9,6 +9,7 @@
     codes: [],
     knowledge: {},     // { 学科: [知识点] }
     settings: {},
+    meta: { lastBackupAt: 0, hintSnoozeUntil: 0 },  // 备份提醒状态
     view: 'today',
     filter: { subject: '全部学科', tab: 'all' },
     pending: { img: null, ai: null },
@@ -16,7 +17,7 @@
     busy: false
   };
 
-  var LS_KEYS = { subjects: 'subjects', codes: 'codes', knowledge: 'knowledge', settings: 'settings' };
+  var LS_KEYS = { subjects: 'subjects', codes: 'codes', knowledge: 'knowledge', settings: 'settings', meta: 'meta' };
 
   var DEF_SUBJECTS = ['语文', '数学', '英语', '物理', '化学', '生物', '道法', '历史', '地理'];
 
@@ -235,7 +236,8 @@
         Store.kvGet(LS_KEYS.subjects, null),
         Store.kvGet(LS_KEYS.codes, null),
         Store.kvGet(LS_KEYS.knowledge, null),
-        Store.kvGet(LS_KEYS.settings, null)
+        Store.kvGet(LS_KEYS.settings, null),
+        Store.kvGet(LS_KEYS.meta, null)
       ]);
     }).then(function (r) {
       S.questions = r[0] || [];
@@ -243,6 +245,7 @@
       S.codes = r[2] || DEF_CODES.slice();
       S.knowledge = r[3] || JSON.parse(JSON.stringify(DEF_KNOWLEDGE));
       S.settings = Object.assign({}, DEF_SETTINGS, r[4] || {});
+      S.meta = Object.assign({ lastBackupAt: 0, hintSnoozeUntil: 0 }, r[5] || {});
       // 首次写入默认值
       var jobs = [];
       if (!r[1]) jobs.push(Store.kvSet(LS_KEYS.subjects, S.subjects));
@@ -256,6 +259,19 @@
   function saveCodes() { return Store.kvSet(LS_KEYS.codes, S.codes); }
   function saveSubjects() { return Store.kvSet(LS_KEYS.subjects, S.subjects); }
   function saveKnowledge() { return Store.kvSet(LS_KEYS.knowledge, S.knowledge); }
+  function saveMeta() { return Store.kvSet(LS_KEYS.meta, S.meta); }
+
+  /* 备份提醒：题库非空 + 从未备份 或 距上次备份 ≥ 7 天 */
+  var BACKUP_EVERY = 7 * DAY;
+  function backupState() {
+    if (!S.questions.length) return null;
+    var now = Date.now();
+    if ((S.meta.hintSnoozeUntil || 0) > now) return null;
+    var last = S.meta.lastBackupAt || 0;
+    if (!last) return { never: true, days: 0 };
+    if (now - last >= BACKUP_EVERY) return { never: false, days: Math.floor((now - last) / DAY) };
+    return null;
+  }
 
   /* ============ 业务规则 ============ */
   function codeName(id) {
@@ -390,6 +406,18 @@
       '<div class="stat-cell"><b>' + todayDone + '</b><span>今日已练</span></div>' +
       '</div>';
 
+    var bs = backupState();
+    if (bs) {
+      hero += '<div class="backup-bar">' +
+        '<div class="bb-txt">' +
+        '<b>' + (bs.never ? '还没备份过' : '上次备份 ' + bs.days + ' 天前') + '</b>' +
+        '<span>' + (bs.never ? '换设备、清缓存、换网址都会丢' : '建议每周存一份，搬家靠它') + '</span>' +
+        '</div>' +
+        '<button class="btn btn-sm btn-primary" id="btnBackupNow">存一份</button>' +
+        '<button class="bb-x" id="btnBackupLater" aria-label="三天后再提醒">×</button>' +
+        '</div>';
+    }
+
     $('#todayHero').innerHTML = hero;
 
     var body = '';
@@ -418,6 +446,14 @@
     if (b3) b3.onclick = function () { go('add'); };
     var b4 = $('#emptyDemo');
     if (b4) b4.onclick = loadDemo;
+    var b5 = $('#btnBackupNow');
+    if (b5) b5.onclick = function () { exportData(); };
+    var b6 = $('#btnBackupLater');
+    if (b6) b6.onclick = function () {
+      S.meta.hintSnoozeUntil = Date.now() + 3 * DAY;
+      saveMeta(); renderToday();
+      toast('三天后再提醒');
+    };
   }
 
   function qCardHTML(q, mode) {
@@ -723,6 +759,26 @@
   function renderSettings() {
     var s = S.settings;
     var html = '';
+
+    // 备份置顶：这是唯一能保住题库的出口
+    var last = S.meta.lastBackupAt || 0;
+    html += '<div class="card card-backup"><h3>备份与数据 <span>' + S.questions.length + ' 题</span></h3>' +
+      '<div class="bk-hero">' +
+      '<div class="bk-t">' + (last ? '上次备份：' + dayKey(last) : '还没备份过') + '</div>' +
+      '<div class="bk-d">题库只存在这台设备上。换手机、清缓存、换网址都会丢，搬家只认这份 JSON。</div>' +
+      '<button class="btn btn-primary btn-block" data-act="export">导出备份（存 JSON）</button>' +
+      '<div class="btn-row">' +
+      '<button class="btn btn-sm btn-ghost" data-act="import">导入备份</button>' +
+      '<button class="btn btn-sm btn-ghost" data-act="pdf">导出 PDF</button>' +
+      '</div>' +
+      '</div>' +
+      '<div class="set-row"><div><div class="lbl">存储方式</div><div class="sub">' +
+      (Store.mode === 'idb' ? '本机 IndexedDB，图片也存本地' : '本机 localStorage（容量有限）') +
+      '</div></div><span class="val">' + (last ? fmtShort(last) + '已备份' : '未备份') + '</span></div>' +
+      '<div class="set-row"><div><div class="lbl" style="color:var(--danger)">清空题库</div><div class="sub">不可恢复，先导出备份</div></div>' +
+      '<button class="btn btn-sm btn-danger-ghost" data-act="clear">清空</button></div>' +
+      '</div>';
+
     html += '<div class="card"><h3>自动识别 <span>' + (aiReady() ? '已配置' : '未配置') + '</span></h3>' +
       '<div class="set-row"><div><div class="lbl">接口地址</div><div class="sub">OpenAI 兼容的 /v1 地址，支持视觉模型</div></div>' +
       '<button class="btn btn-sm btn-ghost" data-act="editAI">设置</button></div>' +
@@ -751,19 +807,6 @@
     html += '<div class="card"><h3>学科 <span>' + S.subjects.length + ' 个</span></h3>' +
       '<div class="chips">' + S.subjects.map(function (x) { return '<span class="chip">' + esc(x) + '</span>'; }).join('') + '</div>' +
       '<div class="btn-row"><button class="btn btn-sm btn-ghost" data-act="addSubject">新增学科</button></div></div>';
-
-    html += '<div class="card"><h3>数据</h3>' +
-      '<div class="set-row"><div><div class="lbl">存储方式</div><div class="sub">' + (Store.mode === 'idb' ? '本机 IndexedDB，图片也存本地' : '本机 localStorage（容量有限）') + '</div></div>' +
-      '<span class="val">' + S.questions.length + ' 题</span></div>' +
-      '<div class="set-row"><div><div class="lbl">导出 PDF</div><div class="sub">按学科分册，A4 版式，打印装订成纸质册</div></div>' +
-      '<button class="btn btn-sm btn-ghost" data-act="pdf">导出</button></div>' +
-      '<div class="set-row"><div><div class="lbl">导出备份</div><div class="sub">JSON 文件，换手机时导入</div></div>' +
-      '<button class="btn btn-sm btn-ghost" data-act="export">导出</button></div>' +
-      '<div class="set-row"><div><div class="lbl">导入备份</div><div class="sub">合并到当前题库，按 id 去重</div></div>' +
-      '<button class="btn btn-sm btn-ghost" data-act="import">导入</button></div>' +
-      '<div class="set-row"><div><div class="lbl" style="color:var(--danger)">清空题库</div><div class="sub">不可恢复，先导出备份</div></div>' +
-      '<button class="btn btn-sm btn-danger-ghost" data-act="clear">清空</button></div>' +
-      '</div>';
 
     html += '<div class="footnote">错题本 v1 · 数据只存在这台设备上，不上传服务器。<br>想手机拍、电脑看，需要再加云端同步。</div>';
     $('#settingsBody').innerHTML = html;
@@ -1020,6 +1063,7 @@
       go(b.getAttribute('data-view'));
     });
     $('#btnQuickAdd').addEventListener('click', function () { go('add'); });
+    $('#btnBackup').addEventListener('click', function () { exportData(true); });
 
     // 上传
     $('#btnCam').onclick = function () { $('#camInput').click(); };
@@ -1242,7 +1286,7 @@
     toast('已添加');
   }
 
-  function exportData() {
+  function exportData(silent) {
     var pack = {
       app: 'cuotiben',
       version: 1,
@@ -1260,7 +1304,12 @@
     setTimeout(function () {
       URL.revokeObjectURL(a.href); a.remove();
     }, 800);
-    toast('已导出');
+    S.meta.lastBackupAt = Date.now();
+    S.meta.hintSnoozeUntil = 0;
+    saveMeta();
+    toast('已导出 ' + S.questions.length + ' 题', silent ? 1500 : 1900);
+    renderToday();
+    if (S.view === 'settings') renderSettings();
   }
 
   function importData() {
