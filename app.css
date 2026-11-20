@@ -688,3 +688,31 @@ body.pv-open{overflow:hidden}
 
 /* 题库页工具条 */
 .bank-tools{display:flex;justify-content:flex-end;padding:2px 0 10px}
+
+/* ---------- 顶栏动作组 ---------- */
+.top-actions{display:flex;align-items:center;gap:8px;flex:0 0 auto}
+
+/* ---------- 首页：备份提醒条 ---------- */
+.backup-bar{
+  display:flex;align-items:center;gap:10px;
+  margin:12px 2px 0;padding:11px 10px 11px 13px;
+  background:#FFF8E6;border:1px solid #FFE0A3;border-radius:14px;
+  letter-spacing:0;
+}
+.backup-bar .bb-txt{flex:1;min-width:0}
+.backup-bar b{display:block;font-size:13.5px;color:#8A5A00;font-weight:600;line-height:1.35}
+.backup-bar .bb-txt span{display:block;font-size:11.5px;color:#A5761F;margin-top:3px;line-height:1.5}
+.backup-bar .btn{flex:0 0 auto;white-space:nowrap}
+.backup-bar .bb-x{
+  flex:0 0 auto;width:26px;height:26px;padding:0;border:0;border-radius:50%;
+  background:transparent;color:#B5913F;font-size:17px;line-height:1;
+  display:grid;place-items:center;-webkit-tap-highlight-color:transparent;
+}
+.backup-bar .bb-x:active{background:rgba(138,90,0,.1)}
+
+/* ---------- 设置：备份卡片（置顶） ---------- */
+.btn-block{display:block;width:100%;padding:13px 16px;font-size:15px}
+.card-backup .bk-hero{padding:4px 0 6px}
+.card-backup .bk-t{font-size:15.5px;font-weight:600;letter-spacing:-.2px}
+.card-backup .bk-d{font-size:12px;color:var(--muted);margin:6px 0 13px;line-height:1.6}
+.card-backup .btn-row{margin-top:9px}
