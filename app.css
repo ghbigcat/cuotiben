@@ -219,6 +219,7 @@ main{padding:0 16px}
 }
 .ai-bar-l{display:flex;align-items:center;gap:7px;font-size:12.5px;color:var(--muted);min-width:0}
 .ai-bar-l span:last-child{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.ai-bar .btn{flex:0 0 auto;white-space:nowrap}
 .dot{width:8px;height:8px;border-radius:50%;background:#C7C7CC;flex:0 0 auto}
 .dot.on{background:var(--ok);box-shadow:0 0 0 3px rgba(52,199,89,.16)}
 .dot.busy{background:var(--warn);animation:pulse 1s infinite}
@@ -244,6 +245,8 @@ main{padding:0 16px}
 }
 .field textarea{resize:vertical;line-height:1.55;min-height:70px}
 .field-row{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+/* 录题页：学科置于拍照之前，作为第一步 */
+.field-first{margin-bottom:13px}
 
 .chips{display:flex;flex-wrap:wrap;gap:7px}
 .chip{
