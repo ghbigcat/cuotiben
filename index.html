@@ -166,15 +166,19 @@
         <div id="cropWrap" hidden>
           <div class="seg-switch" id="segSwitch">
             <button type="button" class="on" data-seg="h">横切 · 逐行</button>
-            <button type="button" data-seg="v">竖切 · 分栏</button>
+            <button type="button" data-seg="v">竖切 · 分块</button>
           </div>
+          <label class="vscope" id="vScopeRow" hidden>
+            <input type="checkbox" id="vAll">
+            <span>贯穿整页（双栏排版的卷子才用）</span>
+          </label>
           <div class="crop-stage" id="cropStage">
             <div class="crop-inner" id="cropInner">
               <img id="cropImg" alt="切题预览">
               <div class="crop-layer" id="cropLayer"></div>
             </div>
           </div>
-          <p class="crop-hint" id="cropHint">点页面任意位置横切一刀 · 拖动蓝线调整边界 · 点 × 把这块并到下一块</p>
+          <p class="crop-hint" id="cropHint">点页面任意位置横切一刀 · 拖那条蓝线上下微调 · 点线尾的 × 去掉这条线</p>
           <div class="btn-row">
             <button class="btn btn-ghost btn-sm" id="btnAutoSeg">重新自动切</button>
             <button class="btn btn-ghost btn-sm" id="btnAiSeg">AI 切题</button>
