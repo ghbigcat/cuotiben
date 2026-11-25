@@ -11,7 +11,8 @@
     settings: {},
     meta: { lastBackupAt: 0, hintSnoozeUntil: 0 },  // 备份提醒状态
     view: 'today',
-    filter: { subject: '全部学科', tab: 'all' },
+    filter: { subject: '全部学科', tab: 'all', time: 'all', level: 'all', code: 'all', kn: '' },
+    statsSub: '全部',
     pending: { img: null, ai: null },
     redo: null,
     busy: false
@@ -212,20 +213,34 @@
   }
 
   var PROMPT_VARIANT = [
-    '你是初中出题老师。基于下面这道错题，出 2 道同类变式题，用来检验同一个知识点是否真的掌握了。',
+    '你是初中出题老师。基于下面这道错题，出 N 道同类变式题，用来检验同一个知识点是否真的掌握了。',
     '要求：同一知识点、同等难度、换数字或换情境，不要出原题；每题给出答案要点。',
     '只输出 JSON：{"variants":[{"stem":"题目","answer":"答案要点"}]}'
   ].join('\n');
 
-  function aiVariants(q) {
+  function aiVariants(q, n) {
+    var cnt = n || 2;
+    var p = PROMPT_VARIANT.replace('出 N 道', '出 ' + cnt + ' 道');
     var body = '学科：' + q.subject + '\n知识点：' + q.knowledge + '\n原题：\n' + (q.stem || q.note || '（无文本）');
     return aiChat([
-      { role: 'user', content: [{ type: 'text', text: PROMPT_VARIANT + '\n\n' + body }] }
+      { role: 'user', content: [{ type: 'text', text: p + '\n\n' + body }] }
     ], 1200).then(function (txt) {
       var j = extractJSON(txt);
       if (!j || !j.variants) throw new Error('变式题生成失败');
       return j.variants;
     });
+  }
+
+  var PROMPT_SOLVE = [
+    '你是中学老师，正在给学生讲这道错题。用中文回答，分四段写，每段以「考点：」「关键一步：」「完整解法：」「易错点：」开头，',
+    '不要用 Markdown 的 # 或 * 符号，不要重复题目原文。讲解要具体到能照着算一遍。'
+  ].join('\n');
+
+  function aiSolve(q) {
+    var content = [{ type: 'text', text: PROMPT_SOLVE + '\n\n学科：' + q.subject + '\n知识点：' + q.knowledge +
+      '\n题干：' + (q.stem || '（见图片）') + '\n学生记下的卡点：' + (q.note || '无') }];
+    if (q.image) content.push(imagePart(q.image));
+    return aiChat([{ role: 'user', content: content }], 1100);
   }
 
   /* ============ 存储读写 ============ */
@@ -279,6 +294,34 @@
     return c ? c.name : id;
   }
   function isRepeat(q) { return (q.wrongCount || 1) >= 2; }
+
+  /* 掌握程度：由复习状态派生，四档（与 PDF 分册、学情分析同一口径）
+     mastered → 完全懂；连对 ≥2 → 基本懂；连对 1 → 略懂；其余 → 完全不懂 */
+  var LEVELS = [
+    { k: 'solid', n: '完全懂', c: '#34C759' },
+    { k: 'basic', n: '基本懂', c: '#F2C744' },
+    { k: 'vague', n: '略懂', c: '#FF9500' },
+    { k: 'unknown', n: '完全不懂', c: '#FF3B30' }
+  ];
+  function levelOf(q) {
+    if (q.status === 'mastered') return 'solid';
+    var st = q.streak || 0;
+    if (st >= 2) return 'basic';
+    if (st === 1) return 'vague';
+    return 'unknown';
+  }
+  function levelInfo(k) {
+    for (var i = 0; i < LEVELS.length; i++) if (LEVELS[i].k === k) return LEVELS[i];
+    return LEVELS[3];
+  }
+  function lvBadge(q) {
+    var lv = levelInfo(levelOf(q));
+    return '<span class="lv-badge" style="--lv:' + lv.c + '">' + lv.n + '</span>';
+  }
+  /* 答错次数：重做里判错的次数（首次录入不算答错） */
+  function missCount(q) {
+    return (q.attempts || []).filter(function (a) { return !a.ok; }).length;
+  }
   function dueOf(q) { return q.dueAt || q.createdAt; }
   function isDue(q) {
     return q.status === 'active' && dueOf(q) < today0() + DAY;
@@ -346,7 +389,7 @@
     today: ['今天', '拍 · 录 · 做 · 批 · 斩'],
     add: ['录题', '拍一张，自动归档'],
     bank: ['题库', '按知识点和错因翻'],
-    stats: ['统计', '哪块最薄弱，看得见'],
+    stats: ['学情分析', '哪块最薄弱，看得见'],
     settings: ['设置', '识别、错因码、数据'],
     redo: ['重做', '不看答案，先自己做']
   };
@@ -629,48 +672,182 @@
   }
 
   /* ============ 题库 ============ */
-  function renderBank() {
-    var subs = ['全部学科'].concat(S.subjects);
-    var tabs = [
-      { k: 'all', n: '全部' },
-      { k: 'due', n: '待重做' },
-      { k: 'repeat', n: '反复错' },
-      { k: 'mastered', n: '已斩' }
-    ];
-    var row1 = subs.map(function (s) {
-      return '<button class="chip' + (s === S.filter.subject ? ' on' : '') + '" data-sub="' + esc(s) + '">' + esc(s) + '</button>';
-    }).join('');
-    var row2 = tabs.map(function (t) {
-      return '<button class="chip flat' + (t.k === S.filter.tab ? ' on' : '') + '" data-tab="' + t.k + '">' + t.n + '</button>';
-    }).join('');
-    $('#bankFilters').innerHTML =
-      '<div class="filters">' + row1 + '</div>' +
-      '<div class="filters filters-tab">' + row2 + '</div>' +
-      '<div class="bank-tools"><button class="btn btn-sm btn-ghost" data-act="pdf">导出 PDF · 打印</button></div>';
+  /* ============ 题库 · 列表与筛选 ============ */
+  var TIME_OPTS = [
+    { k: 'all', n: '全部时间' },
+    { k: '7', n: '近 7 天' },
+    { k: '30', n: '近 30 天' },
+    { k: 'old', n: '30 天以前' }
+  ];
+  var LEVEL_OPTS = [{ k: 'all', n: '全部程度' }].concat(LEVELS.map(function (lv) { return { k: lv.k, n: lv.n }; }));
+  var MORE_OPTS = [
+    { k: 'all', n: '全部状态' },
+    { k: 'due', n: '今天待重做' },
+    { k: 'repeat', n: '反复错（≥2 次）' },
+    { k: 'mastered', n: '已斩' },
+    { k: 'hasimg', n: '有原题图片' }
+  ];
 
-    var list = S.questions.slice().sort(function (a, b) { return b.createdAt - a.createdAt; });
-    if (S.filter.subject !== '全部学科') {
-      list = list.filter(function (q) { return q.subject === S.filter.subject; });
-    }
-    if (S.filter.tab === 'due') list = list.filter(isDue);
-    if (S.filter.tab === 'repeat') list = list.filter(function (q) { return isRepeat(q) && q.status === 'active'; });
-    if (S.filter.tab === 'mastered') list = list.filter(function (q) { return q.status === 'mastered'; });
-
-    if (!list.length) {
-      $('#bankList').innerHTML = '<div class="empty"><div class="ico">◻</div><p>这个筛选下没有题</p><small>换个学科，或者先去录一道题</small></div>';
-      return;
-    }
-    $('#bankList').innerHTML =
-      '<div class="block-title"><h2>共 ' + list.length + ' 道</h2><span class="side">点开看详情</span></div>' +
-      list.map(function (q) { return qCardHTML(q, 'bank'); }).join('');
+  function optName(opts, k) {
+    for (var i = 0; i < opts.length; i++) if (opts[i].k === k) return opts[i].n;
+    return opts[0].n;
+  }
+  function ymd(ts) {
+    var d = new Date(ts);
+    return d.getFullYear() + '.' + (d.getMonth() + 1) + '.' + d.getDate();
   }
 
-  /* ============ 统计 ============ */
+  function bankFiltered() {
+    var f = S.filter;
+    var list = S.questions.slice().sort(function (a, b) { return b.createdAt - a.createdAt; });
+    if (f.subject !== '全部学科') list = list.filter(function (q) { return q.subject === f.subject; });
+    if (f.time === '7') list = list.filter(function (q) { return q.createdAt >= today0() - 6 * DAY; });
+    else if (f.time === '30') list = list.filter(function (q) { return q.createdAt >= today0() - 29 * DAY; });
+    else if (f.time === 'old') list = list.filter(function (q) { return q.createdAt < today0() - 29 * DAY; });
+    if (f.level !== 'all') list = list.filter(function (q) { return levelOf(q) === f.level; });
+    if (f.code !== 'all') {
+      list = list.filter(function (q) { return f.code === '__none' ? !q.errorCode : q.errorCode === f.code; });
+    }
+    if (f.kn) list = list.filter(function (q) { return (q.knowledge || '未分类') === f.kn; });
+    if (f.tab === 'due') list = list.filter(isDue);
+    else if (f.tab === 'repeat') list = list.filter(function (q) { return isRepeat(q) && q.status === 'active'; });
+    else if (f.tab === 'mastered') list = list.filter(function (q) { return q.status === 'mastered'; });
+    else if (f.tab === 'hasimg') list = list.filter(function (q) { return !!q.image; });
+    return list;
+  }
+
+  function bankCardHTML(q) {
+    var lv = levelInfo(levelOf(q));
+    var body = q.image
+      ? '<div class="bthumb"><img src="' + q.image + '" alt="原题"></div>'
+      : '<div class="bstem">' + esc((q.stem || '（无题干文本，只有图片）').slice(0, 180)) + '</div>';
+    return '<div class="bcard" data-id="' + q.id + '">' +
+      '<div class="bcard-top">' + lvBadge(q) +
+      '<span class="bstat">练习 ' + (q.attempts || []).length + ' 次</span>' +
+      '<span class="bstat">答错 ' + missCount(q) + ' 次</span>' +
+      '<span class="bspace"></span>' +
+      '<span class="bmeta-r"><i>' + ymd(q.createdAt) + '</i><i>已导出 ' + (q.exportCount || 0) + ' 次</i></span>' +
+      '</div>' +
+      body +
+      '<div class="bcard-mid"><span class="bkn">' + esc(q.knowledge || '未分类') + '</span>' +
+      (q.errorCode ? '<span class="bcode">' + esc(q.errorCode) + ' ' + esc(codeName(q.errorCode)) + '</span>' : '') +
+      '</div>' +
+      '<div class="bcard-foot">' +
+      '<span class="bsrc">' + esc(q.source || q.subject) + '</span>' +
+      '<button class="qact" data-qact="solve">AI 解题</button>' +
+      '<button class="qact" data-qact="variant">举一反三 ▾</button>' +
+      '</div></div>';
+  }
+
+  function renderBank() {
+    var f = S.filter;
+    var subOpts = [{ k: '全部学科', n: '全部学科' }].concat(S.subjects.map(function (s) { return { k: s, n: s }; }));
+    var codeOpts = [{ k: 'all', n: '全部错因' }, { k: '__none', n: '未标错因' }]
+      .concat(S.codes.map(function (c) { return { k: c.id, n: c.id + ' ' + c.name }; }));
+
+    var bar = '<div class="filter-bar">' +
+      '<button class="fbtn' + (f.subject !== '全部学科' ? ' on' : '') + '" data-pick="subject">' +
+      esc(f.subject === '全部学科' ? '学科' : f.subject) + '<i>▾</i></button>' +
+      '<button class="fbtn' + (f.time !== 'all' ? ' on' : '') + '" data-pick="time">' +
+      esc(f.time === 'all' ? '收集时间' : optName(TIME_OPTS, f.time)) + '<i>▾</i></button>' +
+      '<button class="fbtn' + (f.level !== 'all' ? ' on' : '') + '" data-pick="level">' +
+      esc(f.level === 'all' ? '掌握程度' : optName(LEVEL_OPTS, f.level)) + '<i>▾</i></button>' +
+      '<button class="fbtn' + ((f.tab !== 'all' || f.code !== 'all' || f.kn) ? ' on' : '') + '" data-pick="more">更多筛选<i>▾</i></button>' +
+      '</div>';
+
+    var chips = '';
+    if (f.kn) chips += '<span class="fchip">知识点：' + esc(f.kn) + '<b data-clear="kn">×</b></span>';
+    if (f.code !== 'all') chips += '<span class="fchip">错因：' + esc(f.code === '__none' ? '未标' : f.code) + '<b data-clear="code">×</b></span>';
+    if (f.tab !== 'all') chips += '<span class="fchip">' + esc(optName(MORE_OPTS, f.tab)) + '<b data-clear="tab">×</b></span>';
+    if (chips) bar += '<div class="filter-chips">' + chips + '</div>';
+
+    $('#bankFilters').innerHTML = bar;
+
+    var list = bankFiltered();
+    if (!list.length) {
+      $('#bankList').innerHTML = '<div class="empty"><div class="ico">◻</div><p>这个筛选下没有题</p><small>换个条件，或者先去录一道题</small></div>';
+    } else {
+      $('#bankList').innerHTML =
+        '<div class="block-title"><h2>共 ' + list.length + ' 道</h2><span class="side">点开看详情</span></div>' +
+        list.map(bankCardHTML).join('');
+    }
+
+    var foot = $('#bankFoot');
+    if (foot) {
+      foot.hidden = !list.length;
+      foot.innerHTML = list.length
+        ? '<button class="btn btn-ghost" data-foot="drill">强化练习 ' + list.length + ' 题</button>' +
+          '<button class="btn btn-primary" data-foot="print">打印错题 ' + list.length + ' 题</button>'
+        : '';
+    }
+    return list;
+  }
+
+  /* 筛选选择面板 */
+  function pickFilter(kind) {
+    var f = S.filter, title, opts, cur;
+    if (kind === 'subject') { title = '选学科'; opts = [{ k: '全部学科', n: '全部学科' }].concat(S.subjects.map(function (s) { return { k: s, n: s }; })); cur = f.subject; }
+    else if (kind === 'time') { title = '收集时间'; opts = TIME_OPTS; cur = f.time; }
+    else if (kind === 'level') { title = '掌握程度'; opts = LEVEL_OPTS; cur = f.level; }
+    else if (kind === 'code') { title = '错因码'; opts = [{ k: 'all', n: '全部错因' }, { k: '__none', n: '未标错因' }].concat(S.codes.map(function (c) { return { k: c.id, n: c.id + ' ' + c.name }; })); cur = f.code; }
+    else { title = '更多筛选'; opts = MORE_OPTS; cur = f.tab; }
+
+    var html = '<h2>' + title + '</h2><div class="pick-list">' + opts.map(function (o) {
+      return '<button class="pick-item' + (o.k === cur ? ' on' : '') + '" data-opt="' + esc(o.k) + '">' +
+        esc(o.n) + (o.k === cur ? '<i>✓</i>' : '') + '</button>';
+    }).join('') + '</div>';
+    openSheet(html);
+    $('#sheet').onclick = function (e) {
+      var b = e.target.closest('[data-opt]');
+      if (!b) return;
+      var k = b.getAttribute('data-opt');
+      if (kind === 'subject') f.subject = k;
+      else if (kind === 'time') f.time = k;
+      else if (kind === 'level') f.level = k;
+      else if (kind === 'code') f.code = k;
+      else f.tab = k;
+      closeSheet();
+      renderBank();
+    };
+  }
+
+
+  /* ============ 统计 · 学情分析 ============ */
+  function ringSVG(counts, total) {
+    var R = 78, W = 26, C = 2 * Math.PI * R, acc = 0, segs = '';
+    if (!total) {
+      return '<svg viewBox="0 0 200 200" class="ring"><circle cx="100" cy="100" r="' + R +
+        '" fill="none" stroke="#E5E5EA" stroke-width="' + W + '"/></svg>';
+    }
+    LEVELS.forEach(function (lv) {
+      var n = counts[lv.k] || 0;
+      if (!n) return;
+      var len = C * n / total;
+      var gap = total > 1 ? 2 : 0;
+      segs += '<circle cx="100" cy="100" r="' + R + '" fill="none" stroke="' + lv.c +
+        '" stroke-width="' + W + '" stroke-dasharray="' + Math.max(0.1, len - gap) + ' ' + (C - len + gap) +
+        '" stroke-dashoffset="' + (-acc) + '" transform="rotate(-90 100 100)"/>';
+      acc += len;
+    });
+    return '<svg viewBox="0 0 200 200" class="ring">' + segs + '</svg>';
+  }
+  function pctOf(counts, total) {
+    var r = {}, sum = 0;
+    if (!total) { LEVELS.forEach(function (lv) { r[lv.k] = 0; }); return r; }
+    LEVELS.slice(0, 3).forEach(function (lv) {
+      r[lv.k] = Math.round((counts[lv.k] || 0) / total * 100);
+      sum += r[lv.k];
+    });
+    r.unknown = Math.max(0, 100 - sum);
+    return r;
+  }
+
   function renderStats() {
     var all = S.questions;
     var active = all.filter(function (q) { return q.status === 'active'; });
     if (!all.length) {
-      $('#statsBody').innerHTML = '<div class="empty"><div class="ico">◔</div><p>还没有数据</p><small>录入几道错题，这里就会出现知识点排行和错因分布</small></div>';
+      $('#statsBody').innerHTML = '<div class="empty"><div class="ico">◔</div><p>还没有数据</p><small>录入几道错题，这里就会出现掌握程度和知识点分布</small></div>';
+      var sf0 = $('#statsFoot'); if (sf0) { sf0.hidden = true; sf0.innerHTML = ''; }
       return;
     }
     var mastered = all.filter(function (q) { return q.status === 'mastered'; });
@@ -719,7 +896,44 @@
     }
     var maxDay = Math.max.apply(null, days.map(function (d) { return d.n; }).concat([1]));
 
-    var html = '';
+    // ---- 学情分析（按学科） ----
+    var subTabs = ['全部'].concat(S.subjects);
+    if (subTabs.indexOf(S.statsSub) < 0) S.statsSub = '全部';
+    var scope = S.statsSub === '全部' ? all : all.filter(function (q) { return q.subject === S.statsSub; });
+    var counts = { solid: 0, basic: 0, vague: 0, unknown: 0 };
+    scope.forEach(function (q) { counts[levelOf(q)] += 1; });
+    var pcts = pctOf(counts, scope.length);
+    var kns = {};
+    scope.forEach(function (q) {
+      var k = q.knowledge || '未分类';
+      kns[k] = (kns[k] || 0) + (q.wrongCount || 1);
+    });
+    var knList = Object.keys(kns).map(function (k) { return { n: k, w: kns[k] }; })
+      .sort(function (a, b) { return b.w - a.w; });
+
+    var stat = '<div class="stat-tabs">' + subTabs.map(function (s) {
+      return '<button class="st-tab' + (s === S.statsSub ? ' on' : '') + '" data-statsub="' + esc(s) + '">' + esc(s) + '</button>';
+    }).join('') + '</div>';
+
+    stat += '<div class="ring-wrap">' + ringSVG(counts, scope.length) +
+      '<div class="ring-c"><b>掌握程度</b><span>' + (scope.length ? '共 ' + scope.length + ' 题' : '还没有题') + '</span></div></div>';
+
+    stat += '<div class="lv-legend">' + LEVELS.map(function (lv) {
+      return '<div class="lv-row"><i style="background:' + lv.c + '"></i><span>' + lv.n + '</span><b>' + (pcts[lv.k] || 0) + '%</b></div>';
+    }).join('') + '</div>';
+
+    stat += '<div class="card kn-card"><h3>涉及知识点 <span>' + knList.length + ' 个</span></h3>';
+    stat += knList.length
+      ? '<ol class="kn-list">' + knList.map(function (k, i) {
+        return '<li data-kn="' + esc(k.n) + '"><i>' + (i + 1) + '</i><span>' + esc(k.n) + '</span><b>' + k.w + ' 错</b></li>';
+      }).join('') + '</ol>'
+      : '<div class="kn-none">这一科还没有录题。</div>';
+    stat += '</div>';
+
+    var html = stat;
+
+    html += '<div class="sec-split"><span>整体数据</span></div>';
+
     html += '<div class="card"><h3>总览 <span>累计</span></h3>' +
       '<div class="kv-list">' +
       '<div class="kv"><b>' + all.length + '</b><span>在册错题</span></div>' +
@@ -765,6 +979,14 @@
     }
     html += '</div>';
     $('#statsBody').innerHTML = html;
+
+    var sf = $('#statsFoot');
+    if (sf) {
+      sf.hidden = !scope.length;
+      sf.innerHTML = scope.length
+        ? '<button class="btn btn-primary btn-block" data-foot="paper">根据知识点出试卷 · ' + scope.length + ' 题</button>'
+        : '';
+    }
   }
 
   /* ============ 设置 ============ */
@@ -847,7 +1069,8 @@
   function renderRedo() {
     var q = curQ();
     if (!q) {
-      $('#redoBody').innerHTML = '<div class="empty"><div class="ico">✓</div><p>今天的重做做完了</p><small>明天再来。连着两天都对，就可以斩了。</small>' +
+      $('#redoBody').innerHTML = '<div class="empty"><div class="ico">✓</div><p>' +
+        (S.redo.label ? S.redo.label + '做完了' : '今天的重做做完了') + '</p><small>明天再来。连着两天都对，就可以斩了。</small>' +
         '<div class="btn-row" style="max-width:240px;margin:12px auto 0"><button class="btn btn-primary btn-sm" id="redoBack">回到今天</button></div></div>';
       var b = $('#redoBack');
       if (b) b.onclick = function () { S.redo = null; go('today'); };
@@ -1047,6 +1270,66 @@
     });
   }
 
+  /* ---------- 列表里的 AI 动作（只读，不改题目状态） ---------- */
+  function solveSheet(q) {
+    if (!aiReady()) return toast('先在设置里配大模型，才能 AI 解题');
+    if (!q.stem && !q.image) return toast('这题既没题干也没图片');
+    openSheet('<h2>AI 解题</h2><div class="sub">' + esc(q.subject) + ' · ' + esc(q.knowledge) + '</div>' +
+      (q.image ? '<img class="big" src="' + q.image + '" alt="原题">' : '') +
+      (q.stem ? '<div class="ai-quote">' + esc(q.stem) + '</div>' : '') +
+      '<div id="solveBox" class="ai-out">正在解…</div>');
+    aiSolve(q).then(function (txt) {
+      var box = $('#solveBox');
+      if (box) box.textContent = txt || '（模型没有返回内容）';
+    }).catch(function (e) {
+      var box = $('#solveBox');
+      if (box) { box.style.color = 'var(--danger)'; box.textContent = '失败：' + e.message; }
+    });
+  }
+
+  function variantSheet(q) {
+    if (!aiReady()) return toast('先在设置里配大模型，才能举一反三');
+    if (!q.stem) return toast('这题没有题干文本，先补录题干');
+    openSheet('<h2>举一反三</h2><div class="sub">按这道题的考点出 3 道变式题</div>' +
+      '<div id="varBox" class="ai-out">正在出题…</div>');
+    aiVariants(q, 3).then(function (list) {
+      var box = $('#varBox');
+      if (!box) return;
+      box.innerHTML = list.map(function (v, i) {
+        return '<div class="var-item"><b>变式 ' + (i + 1) + '</b>' +
+          '<div class="var-stem">' + esc(v.stem) + '</div>' +
+          '<div class="var-ans">答案：' + esc(v.answer || '') + '</div></div>';
+      }).join('');
+    }).catch(function (e) {
+      var box = $('#varBox');
+      if (box) { box.style.color = 'var(--danger)'; box.textContent = '失败：' + e.message; }
+    });
+  }
+
+  /* ---------- 强化练习 / 打印错题 ---------- */
+  function startRedoWith(ids, label) {
+    if (!ids || !ids.length) return toast('这个筛选下没有题');
+    S.redo = {
+      queue: ids.slice(), total: ids.length, i: 0,
+      answerImg: null, graded: null, label: label || ''
+    };
+    go('redo');
+  }
+
+  function printQuestions(ids) {
+    if (!ids || !ids.length) return toast('没有可打印的题');
+    if (window.CTB_PDF && window.CTB_PDF.openIds) window.CTB_PDF.openIds(ids);
+    else if (window.CTB_PDF) window.CTB_PDF.open();
+  }
+
+  function makePaper() {
+    var scope = S.statsSub === '全部'
+      ? S.questions
+      : S.questions.filter(function (q) { return q.subject === S.statsSub; });
+    var act = scope.filter(function (q) { return q.status === 'active'; });
+    printQuestions((act.length ? act : scope).map(function (q) { return q.id; }));
+  }
+
   function openSheet(html) {
     $('#sheet').innerHTML = '<div class="sheet-grab"></div>' + html;
     $('#sheetHost').hidden = false;
@@ -1208,21 +1491,66 @@
       });
     };
 
-    // 题库筛选
+    // 题库筛选：四个下拉
     $('#bankFilters').addEventListener('click', function (e) {
-      var act = e.target.closest('[data-act]');
-      if (act && act.getAttribute('data-act') === 'pdf') {
-        if (window.CTB_PDF) window.CTB_PDF.open();
+      var pick = e.target.closest('[data-pick]');
+      if (pick) { pickFilter(pick.getAttribute('data-pick')); return; }
+      var clr = e.target.closest('[data-clear]');
+      if (clr) {
+        var k = clr.getAttribute('data-clear');
+        if (k === 'kn') S.filter.kn = '';
+        else if (k === 'code') S.filter.code = 'all';
+        else if (k === 'tab') S.filter.tab = 'all';
+        renderBank();
+      }
+    });
+
+    // 题库卡片：AI 解题 / 举一反三 / 点开详情
+    $('#bankList').addEventListener('click', function (e) {
+      var qa = e.target.closest('[data-qact]');
+      if (qa) {
+        e.stopPropagation();
+        var card = qa.closest('.bcard');
+        var qq = S.questions.filter(function (x) { return x.id === card.getAttribute('data-id'); })[0];
+        if (!qq) return;
+        if (qa.getAttribute('data-qact') === 'solve') solveSheet(qq);
+        else variantSheet(qq);
         return;
       }
-      var b = e.target.closest('.chip');
-      if (!b) return;
-      var sub = b.getAttribute('data-sub');
-      var tab = b.getAttribute('data-tab');
-      if (sub) S.filter.subject = sub;
-      if (tab) S.filter.tab = tab;
-      renderBank();
+      var c = e.target.closest('.bcard');
+      if (c) openDetail(c.getAttribute('data-id'));
     });
+
+    // 题库底部操作条
+    $('#bankFoot').addEventListener('click', function (e) {
+      var b = e.target.closest('[data-foot]');
+      if (!b) return;
+      var list = bankFiltered();
+      var ids = list.map(function (q) { return q.id; });
+      if (b.getAttribute('data-foot') === 'drill') startRedoWith(ids, '强化练习');
+      else printQuestions(ids);
+    });
+
+    // 学情分析：学科 tab / 知识点下钻
+    $('#statsBody').addEventListener('click', function (e) {
+      var t = e.target.closest('[data-statsub]');
+      if (t) {
+        S.statsSub = t.getAttribute('data-statsub');
+        renderStats();
+        return;
+      }
+      var kn = e.target.closest('.kn-list li[data-kn]');
+      if (kn) {
+        S.filter.subject = S.statsSub === '全部' ? '全部学科' : S.statsSub;
+        S.filter.kn = kn.getAttribute('data-kn');
+        S.filter.tab = 'all'; S.filter.time = 'all'; S.filter.level = 'all'; S.filter.code = 'all';
+        go('bank');
+      }
+    });
+    $('#statsFoot').addEventListener('click', function (e) {
+      if (e.target.closest('[data-foot="paper"]')) makePaper();
+    });
+
     // 卡片点击进详情
     document.addEventListener('click', function (e) {
       var card = e.target.closest('.qcard');
