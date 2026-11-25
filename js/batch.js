@@ -1,7 +1,14 @@
 /* 错题本 · 整页切题（批量录入）
    一张卷子拍一次 → 自动切成多道题 → 逐题确认入库
-   切分算法纯本地：灰度 + Otsu 二值化 + 行投影空白带检测，不需要联网、不需要大模型
-   两种切法：横切（逐行，默认）与竖切（先分栏，栏内再按行切）
+   切分算法纯本地：灰度 + Otsu 二值化 + 行/列投影空白带检测，不需要联网、不需要大模型
+
+   结构：一棵区域树（region tree）
+     节点沿一个方向切分 —— 'h' 横切（上下叠）、'v' 竖切（左右排）
+     没有 dir 的节点就是叶子，一片叶子 = 一道题
+   所以：
+     · 横切：点哪一块，就只在那块里横着切一刀
+     · 竖切：点哪一块，就只把这一块竖着分成左右两半（不再一竖到底）
+     · 只有勾了「贯穿整页」才整页分栏（语文/英语那种双栏排版用）
 */
 (function () {
   'use strict';
@@ -13,25 +20,29 @@
   var B = {
     src: '',
     img: null,
-    /* 分栏：每栏有自己的行切点与左右裁切边界
-       x0/x1 = 用户定的栏边界（0..1）；cx0/cx1 = 去掉白边后的实际裁切边界 */
-    cols: [{ x0: 0, x1: 1, cx0: 0, cx1: 1, segs: [] }],
-    bounds: { x0: 0, x1: 1 },
+    root: null,          // 区域树的根
     items: [],
     unified: { subject: '', source: '', code: '' },
     mode: 'single',
-    vMode: false,      // 竖切模式
+    vMode: false,        // 竖切模式
+    vAll: false,         // 竖切：贯穿整页（整页分栏）
+    twoCol: false,       // 像是两栏排版
     busy: false
   };
 
-  var MIN_SEG = 0.02;    // 单块最小高度（整图比例）
-  var MIN_COL = 0.10;    // 单栏最小宽度（整图比例）
   var MAX_SEGS = 30;     // 超过这个数说明切碎了，重切
 
-  var HINT_H = '点页面任意位置横切一刀 · 拖动蓝线调整边界 · 点 × 把这块并到下一块';
-  var HINT_V = '点页面添一条竖线，把一页分成几栏；每栏内部仍按行切。拖动竖线调栏宽，点 × 合并两栏';
+  /* 切一刀之后最少留多宽 / 多高：跟着块自身尺寸走，小块也切得动 */
+  function minGap(span) { return Math.max(0.006, Math.abs(span) * 0.08); }
 
-  /* ================= 图像分析 ================= */
+  var S = null;          // 采样缓存 { gray, W, H, T, el }
+  var LINES = {};        // 边界线 id → { node, i }（每次渲染重建）
+  var dragEndAt = 0;     // 刚拖完的时间戳，用来吞掉紧随其后的 click
+
+  var HINT_H = '点页面任意位置横切一刀 · 拖那条蓝线上下微调 · 点线尾的 × 去掉这条线';
+  var HINT_V = '点某一块，只把这一块竖着分成两半 · 拖竖线调宽窄 · 想把整页分栏才勾「贯穿整页」';
+
+  /* ================= 图像采样与分析 ================= */
 
   function otsu(hist, total) {
     var sum = 0, i;
@@ -50,7 +61,7 @@
     return T;
   }
 
-  /* 采样成灰度图，返回 {gray, W, H} */
+  /* 采样成灰度图，返回 {gray, W, H, hist} */
   function sampling(imgEl, targetW) {
     var W = targetW || 640;
     var sc = W / imgEl.naturalWidth;
@@ -75,99 +86,145 @@
     return { gray: gray, W: W, H: H, hist: hist };
   }
 
-  /* 主分析：按当前分栏逐栏找左右内容边界 + 行切点 */
-  function analyzeAll(imgEl) {
+  /* 同一张图只采样一次，后面每次切分都复用 */
+  function sample(imgEl) {
+    if (S && S.el === imgEl) return S;
     var s = sampling(imgEl, 640);
-    var W = s.W, H = s.H, gray = s.gray;
-    var T = otsu(s.hist, W * H);
+    var T = otsu(s.hist, s.W * s.H);
     // 纸面拍照常带阴影，Otsu 可能把浅灰当墨迹；收上限保证只认深色
-    T = Math.min(T, 168);
-    T = Math.max(T, 70);
+    s.T = Math.min(168, Math.max(70, T));
+    s.el = imgEl;
+    S = s;
+    return s;
+  }
 
-    // 全宽列墨迹，用来定每一栏的内容左右边界
-    var colInk = new Uint32Array(W);
-    var y, x, base;
-    for (y = 0; y < H; y++) {
-      base = y * W;
-      for (x = 0; x < W; x++) if (gray[base + x] < T) colInk[x]++;
+  function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
+
+  /* 区域内（像素框）内容的左右边界：只在这个 y 带里数墨迹，
+     这样一块里的窄题目不会被同页别的长行撑到整页宽 */
+  function contentX(px0, px1, py0, py1) {
+    var s = S;
+    var W = s.W, gray = s.gray, T = s.T;
+    px0 = clamp(px0, 0, W - 2);
+    px1 = clamp(px1, px0 + 1, W - 1);
+    py0 = clamp(py0, 0, s.H - 2);
+    py1 = clamp(py1, py0 + 1, s.H - 1);
+
+    var h = py1 - py0 + 1;
+    var ink = new Float32Array(px1 - px0 + 1);
+    for (var y = py0; y <= py1; y++) {
+      var base = y * W;
+      for (var x = px0; x <= px1; x++) if (gray[base + x] < T) ink[x - px0]++;
     }
 
-    var colTh = Math.max(2, H * 0.004);
-    var padX = Math.round(W * 0.012);
+    var th = Math.max(2, h * 0.004);
+    var pad = Math.round(W * 0.012);
+    var xL = -1, xR = -1, i;
+    for (i = 0; i < ink.length; i++) if (ink[i] > th) { xL = px0 + i; break; }
+    for (i = ink.length - 1; i >= 0; i--) if (ink[i] > th) { xR = px0 + i; break; }
+    if (xL < 0 || xR < 0) {
+      return { cx0: px0 / W, cx1: (px1 + 1) / W, xL: px0, xR: px1 };
+    }
+    var a = Math.max(px0, xL - pad), b = Math.min(px1, xR + pad);
+    return { cx0: a / W, cx1: (b + 1) / W, xL: a, xR: b };
+  }
 
-    // 单栏时顺手判断「这是不是两栏排版」：中间一条竖带几乎没有墨迹，两侧都有
-    B.twoCol = false;
-    if (B.cols.length === 1) {
-      var dens = function (a, b) {
-        var sum = 0;
-        for (var k = a; k <= b; k++) sum += colInk[k];
-        return sum / Math.max(1, (b - a + 1));
+  function applyContent(leaf) {
+    if (!S) return leaf;
+    var H = S.H, W = S.W;
+    var r = contentX(Math.round(leaf.x0 * W), Math.round(leaf.x1 * W) - 1,
+      Math.round(leaf.y0 * H), Math.round(leaf.y1 * H) - 1);
+    leaf.cx0 = r.cx0; leaf.cx1 = r.cx1;
+    return leaf;
+  }
+
+  function refreshContent(node) {
+    if (!S || !node) return;
+    leavesOf(node).forEach(applyContent);
+  }
+
+  /* 在一个纵向区间里按行切块，返回 'h' 节点（没有内容时返回叶子） */
+  function analyzeRegionH(x0, x1, y0, y1) {
+    var node = { x0: x0, x1: x1, y0: y0, y1: y1, dir: null, cx0: x0, cx1: x1 };
+    var s = S;
+    if (!s) return node;
+    var W = s.W, H = s.H, gray = s.gray, T = s.T;
+    var px0 = clamp(Math.round(x0 * W), 0, W - 2);
+    var px1 = clamp(Math.round(x1 * W) - 1, px0 + 1, W - 1);
+    var py0 = clamp(Math.round(y0 * H), 0, H - 2);
+    var py1 = clamp(Math.round(y1 * H) - 1, py0 + 1, H - 1);
+
+    var cx = contentX(px0, px1, py0, py1);
+    node.cx0 = cx.cx0; node.cx1 = cx.cx1;
+
+    // 行墨迹：只在本区内容宽度内统计（排除页面外的深色桌面）
+    var Hs = py1 - py0 + 1;
+    var rowInk = new Float32Array(Hs);
+    var w = Math.max(1, cx.xR - cx.xL + 1);
+    for (var y = py0; y <= py1; y++) {
+      var base = y * W, d = 0;
+      for (var x = cx.xL; x <= cx.xR; x++) if (gray[base + x] < T) d++;
+      rowInk[y - py0] = d / w;
+    }
+
+    // 页码 / 装订线 / 扫描污点：孤立的小块墨迹会干扰切分，先剔掉
+    dropOrphans(rowInk, Hs);
+
+    // 空白行阈值：正常文字行 5%~30%，空白行≈0
+    var segs = splitByRows(rowInk, Hs, 0.008).segs;
+    if (segs.length > MAX_SEGS) segs = splitByRows(rowInk, Hs, 0.016).segs;
+    if (!segs.length) return node;
+
+    // 相邻块共用一条边界（不各自收缩），这样拖动那条线时两块严丝合缝地跟着走
+    node.dir = 'h';
+    node.kids = segs.map(function (sg) {
+      return {
+        x0: x0, x1: x1,
+        y0: y0 + sg.y0 * (y1 - y0),
+        y1: y0 + sg.y1 * (y1 - y0),
+        dir: null, cx0: cx.cx0, cx1: cx.cx1
       };
-      var lm = dens(Math.round(W * 0.08), Math.round(W * 0.42));
-      var rm = dens(Math.round(W * 0.58), Math.round(W * 0.92));
-      var mm = dens(Math.round(W * 0.46), Math.round(W * 0.54));
-      B.twoCol = Math.min(lm, rm) > H * 0.02 && mm < Math.min(lm, rm) * 0.25;
-    }
-
-    var out = B.cols.map(function (col) {
-      var px0 = Math.max(0, Math.min(W - 2, Math.round(col.x0 * W)));
-      var px1 = Math.max(px0 + 1, Math.min(W - 1, Math.round(col.x1 * W) - 1));
-
-      var xL = px0, xR = px1, found = false;
-      for (x = px0; x <= px1; x++) { if (colInk[x] > colTh) { xL = x; found = true; break; } }
-      for (x = px1; x >= px0; x--) { if (colInk[x] > colTh) { xR = x; break; } }
-      if (!found) { xL = px0; xR = px1; }
-      xL = Math.max(px0, xL - padX);
-      xR = Math.min(px1, xR + padX);
-
-      // 整栏几乎没有墨迹（比如把单栏页硬切成两半）：不产出题目，留着边界可合并回去
-      var inkSum = 0;
-      for (x = px0; x <= px1; x++) inkSum += colInk[x];
-      if (inkSum < H) {
-        return { x0: col.x0, x1: col.x1, cx0: px0 / W, cx1: (px1 + 1) / W, segs: [] };
-      }
-
-      // 只在本栏内容宽度内算行墨迹（排除页面外的深色桌面）
-      var rowInk = new Float32Array(H);
-      var w = xR - xL + 1;
-      for (y = 0; y < H; y++) {
-        base = y * W;
-        var d2 = 0;
-        for (x = xL; x <= xR; x++) { if (gray[base + x] < T) d2++; }
-        rowInk[y] = d2 / w;
-      }
-
-      // 页码 / 装订线 / 扫描污点：孤立的小块墨迹会干扰切分，先剔掉
-      dropOrphans(rowInk, H);
-
-      // 空白行阈值：正常文字行 5%~30%，空白行≈0
-      var r1 = splitByRows(rowInk, H, 0.008);
-      var segs = r1.segs;
-      if (segs.length > MAX_SEGS) segs = splitByRows(rowInk, H, 0.016).segs;
-      if (!segs.length) segs = [{ y0: 0, y1: 1 }];
-      segs = shrinkToContent(segs, rowInk, H, 0.003);
-      if (!segs.length) segs = [{ y0: 0, y1: 1 }];
-
-      return { x0: col.x0, x1: col.x1, cx0: xL / W, cx1: (xR + 1) / W, segs: segs };
     });
+    return node;
+  }
 
-    // 全部栏都是空的（极少见）：兜底给一整块，别让切题区变成空白
-    if (!out.some(function (c) { return c.segs.length; })) {
-      out[0].cx0 = 0; out[0].cx1 = 1; out[0].segs = [{ y0: 0, y1: 1 }];
+  /* 整页分析：默认单栏，从上到下按行切 */
+  function analyzeAll(imgEl) {
+    sample(imgEl);
+    B.twoCol = detectTwoCol();
+    B.root = analyzeRegionH(0, 1, 0, 1);
+    if (!B.root.kids) B.root = { x0: 0, x1: 1, y0: 0, y1: 1, dir: null, cx0: 0, cx1: 1 };
+    return B.root;
+  }
+
+  /* 顺手判断「这是不是两栏排版」：中间一条竖带几乎没有墨迹，两侧都有 */
+  function detectTwoCol() {
+    var s = S;
+    if (!s) return false;
+    var W = s.W, H = s.H, gray = s.gray, T = s.T;
+    var colInk = new Uint32Array(W);
+    for (var y = 0; y < H; y += 2) {
+      var base = y * W;
+      for (var x = 0; x < W; x++) if (gray[base + x] < T) colInk[x]++;
     }
-
-    B.cols = out;
-    B.bounds = { x0: out[0].cx0, x1: out[out.length - 1].cx1 };
-    return out;
+    function dens(a, b) {
+      var sum = 0;
+      for (var k = a; k <= b; k++) sum += colInk[k];
+      return sum / Math.max(1, (b - a + 1));
+    }
+    var lm = dens(Math.round(W * 0.08), Math.round(W * 0.42));
+    var rm = dens(Math.round(W * 0.58), Math.round(W * 0.92));
+    var mm = dens(Math.round(W * 0.46), Math.round(W * 0.54));
+    return Math.min(lm, rm) > (H / 2) * 0.02 && mm < Math.min(lm, rm) * 0.25;
   }
 
   /* 兼容旧调用：单栏分析，不改动当前状态 */
   function analyze(imgEl) {
-    var keepCols = B.cols, keepBounds = B.bounds;
-    B.cols = [{ x0: 0, x1: 1, cx0: 0, cx1: 1, segs: [] }];
-    var r = analyzeAll(imgEl);
-    B.cols = keepCols; B.bounds = keepBounds;
-    return { segs: r[0].segs, bounds: { x0: r[0].cx0, x1: r[0].cx1 } };
+    var keep = B.root;
+    sample(imgEl);
+    var r = analyzeRegionH(0, 1, 0, 1);
+    B.root = keep;
+    return { segs: leavesOf(r), bounds: { x0: r.cx0, x1: r.cx1 } };
   }
 
   /* 剔除孤立墨迹：与上下都有很大间距、自身又很矮的元素（页码、页眉、污点） */
@@ -205,26 +262,11 @@
     }
   }
 
-  /* 每块收缩到自己的内容范围，避免切点落在空白中间导致上下留一大片白 */
-  function shrinkToContent(segs, rowInk, H, inkTh) {
-    return segs.map(function (s) {
-      var y0 = Math.round(s.y0 * H);
-      var y1 = Math.round(s.y1 * H);
-      var a = y0, b = y1, y;
-      for (y = y0; y < y1; y++) { if (rowInk[y] >= inkTh) { a = y; break; } }
-      for (y = y1 - 1; y >= y0; y--) { if (rowInk[y] >= inkTh) { b = y + 1; break; } }
-      var pad = Math.max(4, Math.round((b - a) * 0.04));
-      a = Math.max(0, a - pad);
-      b = Math.min(H, b + pad);
-      return { y0: a / H, y1: b / H };
-    }).filter(function (s) { return s.y1 - s.y0 > 0.004; });
-  }
-
   /* 从空白带的长度分布里找出「题间空白」的门槛。
      行距造成的短空白和题与题之间的长空白会形成两级分布，
      排序后最大的那个跳变点就是分界；没有明显两级时退回中位数法。 */
   function pickGapThreshold(runs, H) {
-    var maxRun = Math.round(H * 0.25);        // 超过整页 1/4 的不算题间空白（那是页脚白）
+    var maxRun = Math.round(H * 0.25);        // 超过整块 1/4 的不算题间空白（那是页脚白）
     var lens = runs
       .filter(function (r) { return r.len >= 3 && r.len <= maxRun; })
       .map(function (r) { return r.len; })
@@ -276,11 +318,7 @@
     cuts.push(bottom);
 
     cuts = cuts.filter(function (v, i, arr) { return i === 0 || v > arr[i - 1]; });
-    var dbg = {
-      top: top, bottom: bottom, gapTh: gapTh, cuts: cuts.slice(), edge: edge,
-      runs: runs.map(function (r) { return r.len; }).filter(function (l) { return l >= 3; })
-    };
-    if (cuts.length < 2) return { segs: [], dbg: dbg };
+    if (cuts.length < 2) return { segs: [] };
 
     // 4) 生成区间并合并过小的块
     var minH = Math.max(22, Math.round(H * 0.028));
@@ -303,30 +341,58 @@
       out.shift();
     }
 
-    return {
-      segs: out.map(function (s) { return { y0: s.y0 / H, y1: s.y1 / H }; }),
-      dbg: dbg
-    };
+    return { segs: out.map(function (s) { return { y0: s.y0 / H, y1: s.y1 / H }; }) };
   }
 
-  /* ================= 结构工具 ================= */
+  /* ================= 区域树工具 ================= */
 
-  /* 按阅读顺序展开：先左栏从上到下，再右栏 */
-  function flatSegs() {
-    var out = [];
-    B.cols.forEach(function (col, ci) {
-      col.segs.forEach(function (seg, si) { out.push({ c: ci, i: si, col: col, seg: seg }); });
-    });
+  /* 按阅读顺序取叶子：横切从上到下，竖切从左到右，嵌套时依次展开 */
+  function leavesOf(node, out) {
+    out = out || [];
+    if (!node) return out;
+    if (!node.dir || !node.kids || !node.kids.length) { out.push(node); return out; }
+    node.kids.forEach(function (k) { leavesOf(k, out); });
     return out;
   }
-  function totalSegs() { return flatSegs().length; }
 
-  function colAt(x) {
-    for (var i = 0; i < B.cols.length; i++) {
-      if (x >= B.cols[i].x0 && x < B.cols[i].x1) return B.cols[i];
+  function isLeaf(n) { return !n || !n.dir || !n.kids || !n.kids.length; }
+
+  function locate(node, x, y) {
+    if (!node) return null;
+    if (isLeaf(node)) return node;
+    for (var i = 0; i < node.kids.length; i++) {
+      var k = node.kids[i];
+      if (x >= k.x0 - 1e-9 && x <= k.x1 + 1e-9 && y >= k.y0 - 1e-9 && y <= k.y1 + 1e-9) {
+        var r = locate(k, x, y);
+        if (r) return r;
+      }
     }
-    return B.cols[B.cols.length - 1];
+    return null;
   }
+
+  function replaceNode(oldN, newN) {
+    if (B.root === oldN) { B.root = newN; return true; }
+    return (function rec(n) {
+      if (!n || !n.kids) return false;
+      for (var i = 0; i < n.kids.length; i++) {
+        if (n.kids[i] === oldN) { n.kids[i] = newN; return true; }
+        if (rec(n.kids[i])) return true;
+      }
+      return false;
+    })(B.root);
+  }
+
+  /* 按轴把节点（连同所有子孙）的坐标从 [f0,f1] 线性映射到 [t0,t1] */
+  function remap(node, axis, f0, f1, t0, t1) {
+    var k = (t1 - t0) / Math.max(1e-6, f1 - f0);
+    (function rec(n) {
+      if (axis === 'y') { n.y0 = t0 + (n.y0 - f0) * k; n.y1 = t0 + (n.y1 - f0) * k; }
+      else { n.x0 = t0 + (n.x0 - f0) * k; n.x1 = t0 + (n.x1 - f0) * k; }
+      if (n.kids) n.kids.forEach(rec);
+    })(node);
+  }
+
+  /* ================= 切分动作 ================= */
 
   function reanalyze() {
     if (!B.img) return;
@@ -334,235 +400,293 @@
     renderCrop();
   }
 
-  /* ================= 交互：切题舞台 ================= */
-
   function autoSegment(silent) {
     if (!B.img) return;
     try {
       analyzeAll(B.img);
       renderCrop();
       if (!silent) {
-        var n = totalSegs();
-        if (n > 1) {
-          api().toast(B.twoCol
-            ? '自动切成 ' + n + ' 题。像是两栏排版，切到「竖切」分栏更准'
-            : '自动切成 ' + n + ' 题，切错可以调');
+        var n = leavesOf(B.root).length;
+        if (B.twoCol) {
+          api().toast('像是两栏排版：切到「竖切」勾上「贯穿整页」，点中间那条缝');
+        } else if (n > 1) {
+          api().toast('自动切成 ' + n + ' 题，切错可以调');
         } else {
-          api().toast('只切出一块。点一下要切的位置就能切；两栏排版切到「竖切」先分栏');
+          api().toast('只切出一块。点一下要切的位置就能切开');
         }
       }
     } catch (e) {
       api().toast('自动切分失败：' + e.message);
-      B.cols.forEach(function (c) { c.segs = [{ y0: 0, y1: 1 }]; });
+      B.root = { x0: 0, x1: 1, y0: 0, y1: 1, dir: null, cx0: 0, cx1: 1 };
       renderCrop();
     }
   }
 
-  function renderCrop() {
-    var wrap = $('#cropWrap');
-    var all = flatSegs();
-    if (!all.length) { wrap.hidden = true; return; }
-    wrap.hidden = false;
-
-    var html = all.map(function (f, idx) {
-      var left = (f.col.x0 * 100).toFixed(3);
-      var w = ((f.col.x1 - f.col.x0) * 100).toFixed(3);
-      var top = (f.seg.y0 * 100).toFixed(3);
-      var h = ((f.seg.y1 - f.seg.y0) * 100).toFixed(3);
-      var tiny = (f.seg.y1 - f.seg.y0) < 0.035;
-      var lastInCol = f.i === f.col.segs.length - 1;
-      return '<div class="crop-seg' + (tiny ? ' tiny' : '') + '" data-c="' + f.c + '" data-i="' + f.i + '"' +
-        ' style="left:' + left + '%;width:' + w + '%;top:' + top + '%;height:' + h + '%">' +
-        '<span class="no">' + (idx + 1) + '</span>' +
-        (f.col.segs.length > 1
-          ? '<button type="button" class="kill" data-kill-c="' + f.c + '" data-kill-i="' + f.i + '" aria-label="合并">×</button>'
-          : '') +
-        (lastInCol ? '' : '<div class="crop-cut" data-cut-c="' + f.c + '" data-cut-i="' + f.i + '"></div>') +
-        '</div>';
-    }).join('');
-
-    // 栏边界：始终显示，竖切模式下可拖、可合并
-    for (var i = 0; i < B.cols.length - 1; i++) {
-      html += '<div class="crop-vcut' + (B.vMode ? ' act' : '') + '" data-vcut="' + i + '"' +
-        ' style="left:' + (B.cols[i].x1 * 100).toFixed(3) + '%">' +
-        '<span class="vtag">' + (i + 1) + '|' + (i + 2) + '</span>' +
-        '<button type="button" class="vkill" data-vkill="' + i + '" aria-label="合并两栏">×</button>' +
-        '</div>';
+  /* 横切：只切点中的那一块 */
+  function splitLeafH(x, y) {
+    var leaf = locate(B.root, x, y);
+    if (!leaf) { api().toast('点在题目那一块上才能切'); return false; }
+    var mg = minGap(leaf.y1 - leaf.y0);
+    if (y - leaf.y0 < mg || leaf.y1 - y < mg) {
+      api().toast('这一块太矮了，离边远一点再点');
+      return false;
     }
-
-    var layer = $('#cropLayer');
-    layer.innerHTML = html;
-    layer.classList.toggle('vmode', B.vMode);   // 竖切模式下横线不再拦截点击
-    $('#btnToItems').textContent = '下一步：逐题确认（' + all.length + ' 题）';
+    var a = { x0: leaf.x0, x1: leaf.x1, y0: leaf.y0, y1: y, dir: null };
+    var b = { x0: leaf.x0, x1: leaf.x1, y0: y, y1: leaf.y1, dir: null };
+    applyContent(a); applyContent(b);
+    replaceNode(leaf, {
+      x0: leaf.x0, x1: leaf.x1, y0: leaf.y0, y1: leaf.y1,
+      dir: 'h', kids: [a, b]
+    });
+    renderCrop();
+    return true;
   }
 
-  function relY(clientY) {
-    var inner = $('#cropInner');
-    var r = inner.getBoundingClientRect();
-    if (!r.height) return 0;
-    return Math.min(1, Math.max(0, (clientY - r.top) / r.height));
-  }
-  function relX(clientX) {
-    var inner = $('#cropInner');
-    var r = inner.getBoundingClientRect();
-    if (!r.width) return 0;
-    return Math.min(1, Math.max(0, (clientX - r.left) / r.width));
+  /* 竖切：只把点中的那一块分成左右两半，上下别的不动 */
+  function splitLeafV(x, y) {
+    var leaf = locate(B.root, x, y);
+    if (!leaf) { api().toast('点在题目那一块上才能切'); return false; }
+    var mg = minGap(leaf.x1 - leaf.x0);
+    if (x - leaf.x0 < mg || leaf.x1 - x < mg) {
+      api().toast('离左右边太近，往中间点点');
+      return false;
+    }
+    var a = { x0: leaf.x0, x1: x, y0: leaf.y0, y1: leaf.y1, dir: null };
+    var b = { x0: x, x1: leaf.x1, y0: leaf.y0, y1: leaf.y1, dir: null };
+    applyContent(a); applyContent(b);
+    replaceNode(leaf, {
+      x0: leaf.x0, x1: leaf.x1, y0: leaf.y0, y1: leaf.y1,
+      dir: 'v', kids: [a, b]
+    });
+    renderCrop();
+    return true;
   }
 
-  function cutRowAt(x, y) {
-    var col = colAt(x);
-    for (var i = 0; i < col.segs.length; i++) {
-      var s = col.segs[i];
-      if (y > s.y0 + MIN_SEG && y < s.y1 - MIN_SEG) {
-        col.segs.splice(i, 1, { y0: s.y0, y1: y }, { y0: y, y1: s.y1 });
-        renderCrop();
-        return true;
+  /* 贯穿整页：整页分栏（两栏排版专用） */
+  function splitPageV(x) {
+    var node = B.root, guard = 0, kid;
+    while (node && node.dir === 'v' && guard++ < 20) {
+      kid = null;
+      for (var i = 0; i < node.kids.length; i++) {
+        if (x > node.kids[i].x0 + 1e-6 && x < node.kids[i].x1 - 1e-6) { kid = node.kids[i]; break; }
       }
+      if (!kid) break;
+      node = kid;
     }
-    return false;
+    if (!node) return false;
+    if (x - node.x0 < minGap(node.x1 - node.x0) || node.x1 - x < minGap(node.x1 - node.x0)) {
+      api().toast('离左右边太近，往中间点点');
+      return false;
+    }
+    // 这一层原来可能是横切的，重新按左右两半分析（旧的横切点会丢，属于预期）
+    var a = analyzeRegionH(node.x0, x, node.y0, node.y1);
+    var b = analyzeRegionH(x, node.x1, node.y0, node.y1);
+    if (!a.dir || !b.dir) {          // 某一边根本没内容（单栏页硬分栏），别切
+      api().toast('这一半没有题目，换个位置切');
+      return false;
+    }
+    node.dir = 'v';
+    node.kids = [a, b];
+    renderCrop();
+    return true;
   }
 
-  function cutColAt(x) {
-    for (var i = 0; i < B.cols.length; i++) {
-      var c = B.cols[i];
-      if (x > c.x0 + MIN_COL && x < c.x1 - MIN_COL) {
-        B.cols.splice(i, 1,
-          { x0: c.x0, x1: x, cx0: c.x0, cx1: x, segs: [] },
-          { x0: x, x1: c.x1, cx0: x, cx1: c.x1, segs: [] });
-        reanalyze();     // 两栏各自重新按行切
-        return true;
-      }
-    }
-    return false;
-  }
-
-  function mergeRowAt(ci, i) {
-    var col = B.cols[ci];
-    if (!col || col.segs.length <= 1) return;
-    if (i < col.segs.length - 1) {
-      col.segs[i + 1].y0 = col.segs[i].y0;   // 并到下一块
-      col.segs.splice(i, 1);
-    } else {
-      col.segs[i - 1].y1 = col.segs[i].y1;   // 最后一块并到上一块
-      col.segs.splice(i, 1);
+  /* 点线尾的 ×：把相邻两块并成一块 */
+  function mergeLine(id) {
+    var L = LINES[id];
+    if (!L) return;
+    var n = L.node, i = L.i;
+    var a = n.kids[i], b = n.kids[i + 1];
+    if (!a || !b) return;
+    var u = {
+      x0: Math.min(a.x0, b.x0), x1: Math.max(a.x1, b.x1),
+      y0: Math.min(a.y0, b.y0), y1: Math.max(a.y1, b.y1),
+      dir: null
+    };
+    applyContent(u);
+    n.kids.splice(i, 2, u);
+    if (n.kids.length === 1) {
+      // 这条线是这一层最后一条：整层收回成一块
+      u.x0 = n.x0; u.x1 = n.x1; u.y0 = n.y0; u.y1 = n.y1;
+      applyContent(u);
+      replaceNode(n, u);
     }
     renderCrop();
   }
 
-  function mergeColAt(i) {
-    if (B.cols.length <= 1) return;
-    var a = B.cols[i], b = B.cols[i + 1];
-    if (!a || !b) return;
-    B.cols.splice(i, 2, { x0: a.x0, x1: b.x1, cx0: a.cx0, cx1: b.cx1, segs: [] });
-    reanalyze();
+  /* ================= 渲染 ================= */
+
+  function pct(v) { return (v * 100).toFixed(3) + '%'; }
+
+  function renderCrop() {
+    var wrap = $('#cropWrap');
+    var all = leavesOf(B.root);
+    if (!all.length) { wrap.hidden = true; return; }
+    wrap.hidden = false;
+
+    LINES = {};
+    var parts = [];
+
+    // 题目块
+    all.forEach(function (l, idx) {
+      l._id = 's' + (idx + 1);
+      var tiny = (l.y1 - l.y0) < 0.035;
+      parts.push('<div class="crop-seg' + (tiny ? ' tiny' : '') + '" data-seg="' + l._id + '" style="' +
+        'left:' + pct(l.x0) + ';top:' + pct(l.y0) + ';width:' + pct(l.x1 - l.x0) + ';height:' + pct(l.y1 - l.y0) + '">' +
+        '<span class="no">' + (idx + 1) + '</span></div>');
+    });
+
+    // 边界线（可拖、可删）
+    var li = 0;
+    (function walk(n) {
+      if (isLeaf(n)) return;
+      n.kids.forEach(walk);
+      for (var i = 0; i < n.kids.length - 1; i++) {
+        var id = 'L' + (++li);
+        LINES[id] = { node: n, i: i };
+        var a = n.kids[i];
+        if (n.dir === 'h') {
+          parts.push('<div class="crop-cut" data-line="' + id + '" style="' +
+            'left:' + pct(n.x0) + ';width:' + pct(n.x1 - n.x0) + ';top:' + pct(a.y1) + '">' +
+            '<button type="button" class="kill" data-kill="' + id + '" aria-label="去掉这条线">×</button>' +
+            '</div>');
+        } else {
+          parts.push('<div class="crop-vcut' + (B.vMode ? ' act' : '') + '" data-line="' + id + '" style="' +
+            'left:' + pct(a.x1) + ';top:' + pct(n.y0) + ';height:' + pct(n.y1 - n.y0) + '">' +
+            '<button type="button" class="vkill" data-kill="' + id + '" aria-label="去掉这条线">×</button>' +
+            '</div>');
+        }
+      }
+    })(B.root);
+
+    var layer = $('#cropLayer');
+    layer.innerHTML = parts.join('');
+    layer.classList.toggle('vmode', B.vMode);
+    var btn = $('#btnToItems');
+    if (btn) btn.textContent = '下一步：逐题确认（' + all.length + ' 题）';
   }
+
+  /* 拖拽过程中只挪框和线，不重建 DOM */
+  function layout() {
+    if (!B.root) return;
+    var layer = $('#cropLayer');
+    leavesOf(B.root).forEach(function (l) {
+      var el = layer.querySelector('[data-seg="' + l._id + '"]');
+      if (!el) return;
+      el.style.left = pct(l.x0); el.style.top = pct(l.y0);
+      el.style.width = pct(l.x1 - l.x0); el.style.height = pct(l.y1 - l.y0);
+    });
+    Object.keys(LINES).forEach(function (id) {
+      var L = LINES[id], n = L.node, a = n.kids[L.i];
+      if (!a) return;
+      var el = layer.querySelector('[data-line="' + id + '"]');
+      if (!el) return;
+      if (n.dir === 'h') {
+        el.style.left = pct(n.x0); el.style.width = pct(n.x1 - n.x0); el.style.top = pct(a.y1);
+      } else {
+        el.style.top = pct(n.y0); el.style.height = pct(n.y1 - n.y0); el.style.left = pct(a.x1);
+      }
+    });
+  }
+
+  function relY(clientY) {
+    var r = $('#cropInner').getBoundingClientRect();
+    if (!r.height) return 0;
+    return Math.min(1, Math.max(0, (clientY - r.top) / r.height));
+  }
+  function relX(clientX) {
+    var r = $('#cropInner').getBoundingClientRect();
+    if (!r.width) return 0;
+    return Math.min(1, Math.max(0, (clientX - r.left) / r.width));
+  }
+
+  /* ================= 交互 ================= */
 
   function bindCropLayer() {
     var layer = $('#cropLayer');
 
-    // 点击：横切 / 竖切 / 合并
     layer.addEventListener('click', function (e) {
-      var kill = e.target.closest('.kill');
+      var kill = e.target.closest('[data-kill]');
       if (kill) {
         e.stopPropagation();
-        mergeRowAt(+kill.getAttribute('data-kill-c'), +kill.getAttribute('data-kill-i'));
+        mergeLine(kill.getAttribute('data-kill'));
         return;
       }
-      var vkill = e.target.closest('.vkill');
-      if (vkill) {
-        e.stopPropagation();
-        mergeColAt(+vkill.getAttribute('data-vkill'));
-        return;
-      }
-      if (e.target.closest('.crop-cut') || e.target.closest('.crop-vcut')) return;
+      // 拖完的那一下不算点切
+      if (Date.now() - dragEndAt < 400) return;
+      if (e.target.closest('[data-line]')) return;
 
       var x = relX(e.clientX), y = relY(e.clientY);
       if (B.vMode) {
-        if (!cutColAt(x)) api().toast('离边界太近，换个位置点');
-        return;
+        if (B.vAll) splitPageV(x); else splitLeafV(x, y);
+      } else {
+        splitLeafH(x, y);
       }
-      if (!cutRowAt(x, y)) api().toast('离边界太近，换个位置点');
     });
 
-    // 拖拽：栏边界 / 行边界
     layer.addEventListener('pointerdown', function (e) {
-      var vc = e.target.closest('.crop-vcut');
-      if (vc) {
-        if (!B.vMode) return;            // 横切模式下竖线只做提示，不响应拖动
-        e.preventDefault();
-        e.stopPropagation();
-        var ci = +vc.getAttribute('data-vcut');
-        var A = B.cols[ci], Bc = B.cols[ci + 1];
-        var movedV = false;
-        function onMoveV(ev) {
-          var x = relX(ev.clientX);
-          x = Math.min(Bc.x1 - MIN_COL, Math.max(A.x0 + MIN_COL, x));
-          A.x1 = x; Bc.x0 = x;
-          movedV = true;
-          vc.style.left = (x * 100).toFixed(3) + '%';
-          $$('#cropLayer .crop-seg[data-c="' + ci + '"]').forEach(function (el) {
-            el.style.width = ((A.x1 - A.x0) * 100).toFixed(3) + '%';
-          });
-          $$('#cropLayer .crop-seg[data-c="' + (ci + 1) + '"]').forEach(function (el) {
-            el.style.left = (x * 100).toFixed(3) + '%';
-            el.style.width = ((Bc.x1 - Bc.x0) * 100).toFixed(3) + '%';
-          });
-        }
-        function onUpV() {
-          document.removeEventListener('pointermove', onMoveV);
-          document.removeEventListener('pointerup', onUpV);
-          if (movedV) reanalyze();          // 栏宽变了，重新按行切
-        }
-        document.addEventListener('pointermove', onMoveV);
-        document.addEventListener('pointerup', onUpV);
-        return;
-      }
+      if (e.target.closest('[data-kill]')) return;   // 交给 click
+      var ln = e.target.closest('[data-line]');
+      if (!ln) return;
+      var L = LINES[ln.getAttribute('data-line')];
+      if (!L) return;
+      var n = L.node, i = L.i;
+      var a = n.kids[i], b = n.kids[i + 1];
+      if (!a || !b) return;
+      if (n.dir === 'v' && !B.vMode) return;         // 横切模式下竖线只做提示
 
-      var cut = e.target.closest('.crop-cut');
-      if (!cut) return;
       e.preventDefault();
       e.stopPropagation();
-      var ci2 = +cut.getAttribute('data-cut-c');
-      var i2 = +cut.getAttribute('data-cut-i');
-      var col = B.cols[ci2];
-      if (!col) return;
-      var s0 = col.segs[i2], s1 = col.segs[i2 + 1];
-      if (!s0 || !s1) return;
-      var segEls = $$('#cropLayer .crop-seg[data-c="' + ci2 + '"]');
-      var moved2 = false;
+
+      var axis = n.dir === 'h' ? 'y' : 'x';
+      var span = axis === 'y' ? (b.y1 - a.y0) : (b.x1 - a.x0);
+      var mg = minGap(span);
+      var minB = (axis === 'y' ? a.y0 : a.x0) + mg;
+      var maxB = (axis === 'y' ? b.y1 : b.x1) - mg;
+      var moved = false;
 
       function onMove(ev) {
-        var y = relY(ev.clientY);
-        y = Math.min(s1.y1 - MIN_SEG, Math.max(s0.y0 + MIN_SEG, y));
-        s0.y1 = y; s1.y0 = y;
-        moved2 = true;
-        if (segEls[i2]) segEls[i2].style.height = ((s0.y1 - s0.y0) * 100).toFixed(3) + '%';
-        if (segEls[i2 + 1]) {
-          segEls[i2 + 1].style.top = (y * 100).toFixed(3) + '%';
-          segEls[i2 + 1].style.height = ((s1.y1 - y) * 100).toFixed(3) + '%';
+        var v = axis === 'y' ? relY(ev.clientY) : relX(ev.clientX);
+        v = Math.min(maxB, Math.max(minB, v));
+        if (Math.abs(v - (axis === 'y' ? a.y1 : a.x1)) < 0.0006) return;
+        if (axis === 'y') {
+          // 上块下边 = 下块上边 = 这条线：两块严丝合缝一起走
+          remap(a, 'y', a.y0, a.y1, a.y0, v);
+          remap(b, 'y', b.y0, b.y1, v, b.y1);
+        } else {
+          remap(a, 'x', a.x0, a.x1, a.x0, v);
+          remap(b, 'x', b.x0, b.x1, v, b.x1);
         }
+        moved = true;
+        layout();
       }
       function onUp() {
         document.removeEventListener('pointermove', onMove);
         document.removeEventListener('pointerup', onUp);
-        if (moved2) renderCrop();
+        document.removeEventListener('pointercancel', onUp);
+        if (!moved) return;
+        dragEndAt = Date.now();
+        refreshContent(a);
+        refreshContent(b);
+        renderCrop();
       }
       document.addEventListener('pointermove', onMove);
       document.addEventListener('pointerup', onUp);
+      document.addEventListener('pointercancel', onUp);
     });
   }
 
   /* ================= 裁剪出单题图 ================= */
 
-  function cropOne(col, seg, maxW, quality) {
+  function cropOne(leaf, maxW, quality) {
     return new Promise(function (resolve, reject) {
       try {
         var img = B.img;
         var iw = img.naturalWidth, ih = img.naturalHeight;
-        var x0 = Math.round(iw * col.cx0);
-        var x1 = Math.round(iw * col.cx1);
-        var y0 = Math.round(ih * seg.y0);
-        var y1 = Math.round(ih * seg.y1);
+        var x0 = Math.round(iw * (leaf.cx0 != null ? leaf.cx0 : leaf.x0));
+        var x1 = Math.round(iw * (leaf.cx1 != null ? leaf.cx1 : leaf.x1));
+        var y0 = Math.round(ih * leaf.y0);
+        var y1 = Math.round(ih * leaf.y1);
         var padY = Math.round((y1 - y0) * 0.05);
         var padX = Math.round((x1 - x0) * 0.03);
         x0 = Math.max(0, x0 - padX);
@@ -586,7 +710,7 @@
   /* ================= 批量确认区 ================= */
 
   function toItems() {
-    var all = flatSegs();
+    var all = leavesOf(B.root);
     if (!all.length) return;
     if (B.busy) return;
     B.busy = true;
@@ -596,12 +720,12 @@
     var prev = B.items;                    // AI 切题预填的字段，数目对得上就沿用
     var keepPrev = prev.length === all.length;
 
-    var jobs = all.map(function (f) { return cropOne(f.col, f.seg, 1200, 0.82); });
+    var jobs = all.map(function (f) { return cropOne(f, 1200, 0.82); });
     Promise.all(jobs).then(function (imgs) {
-      var hts = all.map(function (f) { return f.seg.y1 - f.seg.y0; }).sort(function (a, b) { return a - b; });
+      var hts = all.map(function (f) { return f.y1 - f.y0; }).sort(function (a, b) { return a - b; });
       var medH = hts[Math.floor(hts.length / 2)] || 0;
       B.items = imgs.map(function (src, i) {
-        var h = all[i].seg.y1 - all[i].seg.y0;
+        var h = all[i].y1 - all[i].y0;
         var old = keepPrev ? prev[i] : null;
         return {
           tiny: medH > 0 && h < medH * 0.6,
@@ -633,12 +757,12 @@
 
   /* 没指定过学科时：优先用录题页里选的那个，其次上一道题，最后第一科 */
   function guessSubject() {
-    var S = api().S;
-    if (S.pending && S.pending.subject) return S.pending.subject;
-    var qs = S.questions || [];
+    var St = api().S;
+    if (St.pending && St.pending.subject) return St.pending.subject;
+    var qs = St.questions || [];
     var last = qs[qs.length - 1];
-    if (last && S.subjects.indexOf(last.subject) >= 0) return last.subject;
-    return S.subjects[0] || '数学';
+    if (last && St.subjects.indexOf(last.subject) >= 0) return last.subject;
+    return St.subjects[0] || '数学';
   }
 
   /* 拍照前选过学科，就带进整页切题；没选过则留空让 AI / 上一题兜底
@@ -868,7 +992,6 @@
     var btn = $('#btnAiSeg');
     btn.disabled = true;
     btn.textContent = '识别中…';
-    var hadCols = B.cols.length > 1;
     api().aiChat([
       { role: 'user', content: [{ type: 'text', text: PROMPT_SEG }, api().imagePart(B.src)] }
     ], 2000).then(function (txt) {
@@ -879,13 +1002,15 @@
         .sort(function (a, b) { return a.y0 - b.y0; });
       if (!items.length) throw new Error('返回的位置信息不完整');
 
-      // AI 只按整页纵切，先回到单栏，复用单栏的左右内容边界
-      B.cols = [{ x0: 0, x1: 1, cx0: 0, cx1: 1, segs: [] }];
-      try { analyzeAll(B.img); } catch (e) { /* 忽略：cx 用默认整宽 */ }
-      B.cols[0].segs = items.map(function (x) {
-        return { y0: Math.max(0, x.y0), y1: Math.min(1, x.y1) };
+      // AI 只按整页纵切，回到单栏，再用整页的内容左右边界
+      sample(B.img);
+      var kids = items.map(function (x) {
+        return applyContent({
+          x0: 0, x1: 1, dir: null,
+          y0: Math.max(0, x.y0), y1: Math.min(1, x.y1)
+        });
       });
-      B.bounds = { x0: B.cols[0].cx0, x1: B.cols[0].cx1 };
+      B.root = { x0: 0, x1: 1, y0: 0, y1: 1, dir: 'h', kids: kids };
       renderCrop();
 
       // 预先带回识别到的字段；拍照前选过学科时以用户为准
@@ -902,7 +1027,7 @@
           note: ''
         };
       });
-      api().toast((hadCols ? 'AI 按单栏重切了 ' : 'AI 切出 ') + B.cols[0].segs.length + ' 题，请核对');
+      api().toast('AI 切出 ' + B.root.kids.length + ' 题，请核对');
     }).catch(function (e) {
       api().toast('AI 切题失败：' + e.message);
     }).then(function () {
@@ -918,9 +1043,11 @@
     $$('#segSwitch button').forEach(function (b) {
       b.classList.toggle('on', b.getAttribute('data-seg') === m);
     });
+    var scope = $('#vScopeRow');
+    if (scope) scope.hidden = !B.vMode;
     var hint = $('#cropHint');
     if (hint) hint.textContent = B.vMode ? HINT_V : HINT_H;
-    if ($('#cropLayer') && totalSegs()) renderCrop();
+    if ($('#cropLayer') && B.root) renderCrop();
   }
 
   /* ================= 上传与流程 ================= */
@@ -934,9 +1061,12 @@
       var img = new Image();
       img.onload = function () {
         B.img = img;
-        B.cols = [{ x0: 0, x1: 1, cx0: 0, cx1: 1, segs: [] }];
-        B.bounds = { x0: 0, x1: 1 };
+        S = null;
+        B.root = null;
         setSegMode('h');
+        $('#vScopeRow').hidden = true;
+        $('#vAll').checked = false;
+        B.vAll = false;
         $('#bEmpty').hidden = true;
         $('#bPreview').hidden = true;
         $('#bUploader').hidden = true;
@@ -956,11 +1086,12 @@
   function resetBatch() {
     B.src = '';
     B.img = null;
-    B.cols = [{ x0: 0, x1: 1, cx0: 0, cx1: 1, segs: [] }];
-    B.bounds = { x0: 0, x1: 1 };
+    B.root = null;
+    S = null;
     B.items = [];
     B.unified = { subject: '', source: '', code: '' };
     B.vMode = false;
+    B.vAll = false;
     $('#bEmpty').hidden = false;
     $('#bPreview').hidden = true;
     $('#bUploader').hidden = false;
@@ -971,6 +1102,7 @@
     $('#bFile').value = '';
     $('#bCam').value = '';
     $('#cropLayer').innerHTML = '';
+    $('#vScopeRow').hidden = true;
   }
 
   function setMode(m) {
@@ -1002,6 +1134,12 @@
     $('#segSwitch').addEventListener('click', function (e) {
       var b = e.target.closest('[data-seg]');
       if (b) setSegMode(b.getAttribute('data-seg'));
+    });
+
+    var vAll = $('#vAll');
+    if (vAll) vAll.addEventListener('change', function () {
+      B.vAll = !!vAll.checked;
+      api().toast(B.vAll ? '下次点竖线会贯穿整页' : '只切点中的那一块');
     });
 
     $('#btnAutoSeg').addEventListener('click', function () {
@@ -1044,12 +1182,18 @@
 
   function init() {
     if (!document.getElementById('batchWrap')) return;
-    // 兼容旧接口：state.segs / state.bounds 仍指向第一栏
+    // 兼容旧接口：state.segs 仍是「按阅读顺序的块」
     Object.defineProperty(B, 'segs', {
-      get: function () { return (B.cols[0] && B.cols[0].segs) || []; },
+      get: function () {
+        return leavesOf(B.root).map(function (l) { return { y0: l.y0, y1: l.y1 }; });
+      },
       set: function (v) {
-        B.cols = [{ x0: 0, x1: 1, cx0: 0, cx1: 1, segs: v || [] }];
-        B.bounds = { x0: 0, x1: 1 };
+        var kids = (v || []).map(function (s) {
+          return { x0: 0, x1: 1, y0: s.y0, y1: s.y1, dir: null, cx0: 0, cx1: 1 };
+        });
+        B.root = kids.length
+          ? { x0: 0, x1: 1, y0: 0, y1: 1, dir: 'h', kids: kids }
+          : null;
       }
     });
     bind();
