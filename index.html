@@ -60,6 +60,11 @@
       </div>
 
       <div id="singleWrap">
+      <div class="field field-first" id="fieldSubject">
+        <label>学科 <span class="hint">先选学科，再拍照</span></label>
+        <div class="chips" id="subjectChips"></div>
+      </div>
+
       <div class="uploader" id="uploader">
         <input type="file" id="fileInput" accept="image/*" hidden>
         <input type="file" id="camInput" accept="image/*" capture="environment" hidden>
@@ -94,10 +99,6 @@
       </div>
 
       <form id="addForm" class="form" autocomplete="off">
-        <div class="field">
-          <label>学科</label>
-          <div class="chips" id="subjectChips"></div>
-        </div>
         <div class="field">
           <label>知识点 <span class="req">必填</span></label>
           <input id="fKnowledge" list="knowledgeList" placeholder="如：分式方程增根 / 凸透镜成像">
