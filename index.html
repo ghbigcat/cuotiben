@@ -164,13 +164,17 @@
         </div>
 
         <div id="cropWrap" hidden>
+          <div class="seg-switch" id="segSwitch">
+            <button type="button" class="on" data-seg="h">横切 · 逐行</button>
+            <button type="button" data-seg="v">竖切 · 分栏</button>
+          </div>
           <div class="crop-stage" id="cropStage">
             <div class="crop-inner" id="cropInner">
               <img id="cropImg" alt="切题预览">
               <div class="crop-layer" id="cropLayer"></div>
             </div>
           </div>
-          <p class="crop-hint">点某一块可在该处再切一刀 · 拖动块之间的横线调整边界 · 点 × 把这块并到下一块</p>
+          <p class="crop-hint" id="cropHint">点页面任意位置横切一刀 · 拖动蓝线调整边界 · 点 × 把这块并到下一块</p>
           <div class="btn-row">
             <button class="btn btn-ghost btn-sm" id="btnAutoSeg">重新自动切</button>
             <button class="btn btn-ghost btn-sm" id="btnAiSeg">AI 切题</button>
