@@ -12,7 +12,8 @@
     subs: null,         // null = 全部学科
     scope: 'active',    // active | repeat | mastered | all
     images: true,
-    group: 'knowledge'  // knowledge | time
+    group: 'knowledge', // knowledge | time
+    ids: null           // 指定题集（打印错题 / 出试卷），非空时忽略 subs 与 scope
   };
 
   var SCOPE = [
@@ -54,6 +55,13 @@
   /* ---------- 取数 ---------- */
   function pick() {
     var list = (S.questions || []).slice();
+    // 指定题集（来自题库「打印错题」或学情分析「出试卷」），优先于其它筛选
+    if (CFG.ids && CFG.ids.length) {
+      var order = {};
+      CFG.ids.forEach(function (id, i) { order[id] = i; });
+      return list.filter(function (q) { return order[q.id] !== undefined; })
+        .sort(function (a, b) { return order[a.id] - order[b.id]; });
+    }
     if (CFG.subs && CFG.subs.length) {
       list = list.filter(function (q) { return CFG.subs.indexOf(subjOf(q)) >= 0; });
     }
@@ -287,13 +295,34 @@
     var wait = pending.map(function (im) {
       return new Promise(function (res) { im.onload = im.onerror = res; });
     });
+    bumpExported();
     Promise.all(wait).then(function () {
       setTimeout(function () { window.print(); }, 120);
     });
   }
 
+  /* 记一次导出：题库卡片上会显示「已导出 N 次」 */
+  function bumpExported() {
+    var list = pick();
+    if (!list.length) return;
+    list.forEach(function (q) {
+      q.exportCount = (q.exportCount || 0) + 1;
+      if (CTB.Store) CTB.Store.putQuestion(q);
+    });
+  }
+
+  /* ---------- 直接按题集预览（题库「打印错题」/ 学情「出试卷」） ---------- */
+  function openIds(ids) {
+    if (!ids || !ids.length) return CTB.toast('没有可打印的题');
+    CFG.ids = ids.slice();
+    CFG.subs = null;
+    CFG.scope = 'all';
+    show();
+  }
+
   /* ---------- 配置面板 ---------- */
   function open() {
+    CFG.ids = null;
     if (!S.questions || !S.questions.length) return CTB.toast('题库还是空的，先录几道题');
 
     var have = {};
@@ -404,5 +433,5 @@
     if (allChip) allChip.classList.toggle('on', !CFG.subs);
   }
 
-  window.CTB_PDF = { open: open, print: print, close: close, show: show, cfg: CFG, build: buildHTML };
+  window.CTB_PDF = { open: open, openIds: openIds, print: print, close: close, show: show, cfg: CFG, build: buildHTML };
 })();
