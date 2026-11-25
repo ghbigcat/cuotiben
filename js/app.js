@@ -12,6 +12,7 @@
     meta: { lastBackupAt: 0, hintSnoozeUntil: 0 },  // 备份提醒状态
     view: 'today',
     filter: { subject: '全部学科', tab: 'all', time: 'all', level: 'all', code: 'all', kn: '' },
+    showAns: true,     // 列表里是否展开「答案与错因」
     statsSub: '全部',
     pending: { img: null, ai: null },
     redo: null,
@@ -293,6 +294,10 @@
     var c = S.codes.filter(function (x) { return x.id === id; })[0];
     return c ? c.name : id;
   }
+  function codeDesc(id) {
+    var c = S.codes.filter(function (x) { return x.id === id; })[0];
+    return c ? (c.desc || '') : '';
+  }
   function isRepeat(q) { return (q.wrongCount || 1) >= 2; }
 
   /* 掌握程度：由复习状态派生，四档（与 PDF 分册、学情分析同一口径）
@@ -381,6 +386,7 @@
   function cutQuestion(q) {
     q.status = 'mastered';
     q.masteredAt = Date.now();
+    q.masteredBy = 'verified';   // 走连对两次的正式斩题
     return Store.putQuestion(q);
   }
 
@@ -717,12 +723,23 @@
   }
 
   function bankCardHTML(q) {
-    var lv = levelInfo(levelOf(q));
     var body = q.image
       ? '<div class="bthumb"><img src="' + q.image + '" alt="原题"></div>'
       : '<div class="bstem">' + esc((q.stem || '（无题干文本，只有图片）').slice(0, 180)) + '</div>';
-    return '<div class="bcard" data-id="' + q.id + '">' +
-      '<div class="bcard-top">' + lvBadge(q) +
+
+    var due = isDue(q) ? '<span class="bdue">待复习</span>' : '';
+
+    // 答案 ← 正确解法栏；错因 ← 错因码 + 释义
+    var ans = (q.note || '').trim();
+    var code = q.errorCode
+      ? esc(q.errorCode) + ' ' + esc(codeName(q.errorCode)) + (codeDesc(q.errorCode) ? ' · ' + esc(codeDesc(q.errorCode)) : '')
+      : '';
+    var ansBox =
+      '<p><b>答案：</b>' + (ans ? '<span>' + esc(ans) + '</span>' : '<i class="bans-empty">还没写「正确解法」，点开卡片可补</i>') + '</p>' +
+      '<p><b>错因：</b>' + (code ? '<span>' + code + '</span>' : '<i class="bans-empty">还没标错因码</i>') + '</p>';
+
+    return '<div class="bcard' + (q.status === 'mastered' ? ' done' : '') + '" data-id="' + q.id + '">' +
+      '<div class="bcard-top">' + lvBadge(q) + due +
       '<span class="bstat">练习 ' + (q.attempts || []).length + ' 次</span>' +
       '<span class="bstat">答错 ' + missCount(q) + ' 次</span>' +
       '<span class="bspace"></span>' +
@@ -730,10 +747,14 @@
       '</div>' +
       body +
       '<div class="bcard-mid"><span class="bkn">' + esc(q.knowledge || '未分类') + '</span>' +
-      (q.errorCode ? '<span class="bcode">' + esc(q.errorCode) + ' ' + esc(codeName(q.errorCode)) + '</span>' : '') +
-      '</div>' +
+      (q.source ? '<span class="bsrc">' + esc(q.source) + '</span>' : '') + '</div>' +
+      '<div class="bans-wrap' + (S.showAns ? '' : ' off') + '">' +
+      '<button class="bans-h" data-qact="ans"><span>答案与错因</span><i>▾</i></button>' +
+      '<div class="bans">' + ansBox + '</div></div>' +
       '<div class="bcard-foot">' +
-      '<span class="bsrc">' + esc(q.source || q.subject) + '</span>' +
+      '<button class="qact ok" data-qact="master">' + (q.status === 'mastered' ? '恢复在册' : '标记已掌握') + '</button>' +
+      '<button class="qact del" data-qact="del">删除</button>' +
+      '<span class="bspace"></span>' +
       '<button class="qact" data-qact="solve">AI 解题</button>' +
       '<button class="qact" data-qact="variant">举一反三 ▾</button>' +
       '</div></div>';
@@ -768,7 +789,8 @@
       $('#bankList').innerHTML = '<div class="empty"><div class="ico">◻</div><p>这个筛选下没有题</p><small>换个条件，或者先去录一道题</small></div>';
     } else {
       $('#bankList').innerHTML =
-        '<div class="block-title"><h2>共 ' + list.length + ' 道</h2><span class="side">点开看详情</span></div>' +
+        '<div class="block-title"><h2>共 ' + list.length + ' 道</h2>' +
+        '<button class="bans-all" data-act="ansall">' + (S.showAns ? '收起答案' : '展开答案') + '</button></div>' +
         list.map(bankCardHTML).join('');
     }
 
@@ -921,6 +943,11 @@
     stat += '<div class="lv-legend">' + LEVELS.map(function (lv) {
       return '<div class="lv-row"><i style="background:' + lv.c + '"></i><span>' + lv.n + '</span><b>' + (pcts[lv.k] || 0) + '%</b></div>';
     }).join('') + '</div>';
+
+    var manual = scope.filter(function (q) { return q.status === 'mastered' && q.masteredBy === 'manual'; }).length;
+    if (manual) {
+      stat += '<div class="lv-note">「完全懂」里含 ' + manual + ' 道手动标记的掌握</div>';
+    }
 
     stat += '<div class="card kn-card"><h3>涉及知识点 <span>' + knList.length + ' 个</span></h3>';
     stat += knList.length
@@ -1203,7 +1230,7 @@
       (q.errorCode ? '<span class="tag gray">' + esc(q.errorCode) + ' ' + esc(codeName(q.errorCode)) + '</span>' : '') +
       '<span class="tag gray">' + ['', '易', '中', '难'][q.difficulty || 2] + '</span>' +
       (isRepeat(q) && q.status === 'active' ? '<span class="tag rep">反复错</span>' : '') +
-      (q.status === 'mastered' ? '<span class="tag done">已斩</span>' : '<span class="tag gray">在册</span>') +
+      (q.status === 'mastered' ? '<span class="tag done">' + (q.masteredBy === 'manual' ? '已斩 · 手动' : '已斩') + '</span>' : '<span class="tag gray">在册</span>') +
       '</div>';
     if (q.note) html += '<div style="font-size:13px;color:#3C3C43;line-height:1.65;margin-bottom:12px">' + esc(q.note) + '</div>';
 
@@ -1239,7 +1266,7 @@
       if (act === 'cut') {
         cutQuestion(q).then(function () { closeSheet(); refreshAll(); toast('已斩，这一道从待办里消失了'); });
       } else if (act === 'uncut') {
-        q.status = 'active'; q.streak = 0; q.dueAt = Date.now() + DAY;
+        q.status = 'active'; q.streak = 0; q.dueAt = Date.now() + DAY; q.masteredBy = '';
         Store.putQuestion(q).then(function () { closeSheet(); refreshAll(); toast('已恢复在册'); });
       } else if (act === 'del') {
         if (!confirm('删除这道题？记录一起没掉。')) return;
@@ -1505,16 +1532,51 @@
       }
     });
 
-    // 题库卡片：AI 解题 / 举一反三 / 点开详情
+    // 题库卡片：答案折叠 / 标记已掌握 / 删除 / AI 解题 / 举一反三 / 点开详情
     $('#bankList').addEventListener('click', function (e) {
+      var all = e.target.closest('[data-act="ansall"]');
+      if (all) { S.showAns = !S.showAns; renderBank(); return; }
+
       var qa = e.target.closest('[data-qact]');
       if (qa) {
         e.stopPropagation();
         var card = qa.closest('.bcard');
         var qq = S.questions.filter(function (x) { return x.id === card.getAttribute('data-id'); })[0];
         if (!qq) return;
-        if (qa.getAttribute('data-qact') === 'solve') solveSheet(qq);
-        else variantSheet(qq);
+        var act = qa.getAttribute('data-qact');
+
+        if (act === 'ans') {
+          var wrap = card.querySelector('.bans-wrap');
+          if (wrap) wrap.classList.toggle('off');
+          return;
+        }
+        if (act === 'solve') { solveSheet(qq); return; }
+        if (act === 'variant') { variantSheet(qq); return; }
+
+        if (act === 'master') {
+          if (qq.status === 'mastered') {
+            qq.status = 'active';
+            qq.streak = 0;
+            qq.dueAt = Date.now() + DAY;
+            qq.masteredBy = '';
+            Store.putQuestion(qq).then(function () { renderBank(); toast('已恢复在册'); });
+          } else {
+            qq.status = 'mastered';
+            qq.masteredAt = Date.now();
+            qq.masteredBy = 'manual';
+            Store.putQuestion(qq).then(function () { renderBank(); toast('已标记掌握 · 可从卡片恢复'); });
+          }
+          return;
+        }
+        if (act === 'del') {
+          if (!confirm('删除这道题？记录一起没掉，不能撤销。')) return;
+          Store.delQuestion(qq.id).then(function () {
+            S.questions = S.questions.filter(function (x) { return x.id !== qq.id; });
+            renderBank();
+            toast('已删除');
+          });
+          return;
+        }
         return;
       }
       var c = e.target.closest('.bcard');
