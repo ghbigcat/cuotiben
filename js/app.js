@@ -489,7 +489,7 @@
 
   /* ============ 录题 ============ */
   function renderAdd() {
-    if (!S.pending.subject) S.pending.subject = S.subjects[0] || '数学';
+    if (!S.pending.subject) S.pending.subject = S.settings.lastSubject || S.subjects[0] || '数学';
     renderSubjectChips();
     renderCodeChips();
     renderKnowledgeList();
@@ -581,6 +581,11 @@
     createQuestion(d).then(function () {
       // 记住知识点，下次可补全
       rememberKnowledge(d.subject, knowledge);
+      // 记住学科：下次进录入页默认停在上次用的那科
+      if (S.settings.lastSubject !== d.subject) {
+        S.settings.lastSubject = d.subject;
+        saveSettings();
+      }
       resetAddForm();
       toast('已存入题库，明天出现在待重做里');
       go('bank');
