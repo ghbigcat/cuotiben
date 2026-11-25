@@ -1,6 +1,7 @@
 /* 错题本 · 整页切题（批量录入）
    一张卷子拍一次 → 自动切成多道题 → 逐题确认入库
    切分算法纯本地：灰度 + Otsu 二值化 + 行投影空白带检测，不需要联网、不需要大模型
+   两种切法：横切（逐行，默认）与竖切（先分栏，栏内再按行切）
 */
 (function () {
   'use strict';
@@ -12,16 +13,23 @@
   var B = {
     src: '',
     img: null,
-    segs: [],          // [{y0,y1}] 相对整图 0..1
+    /* 分栏：每栏有自己的行切点与左右裁切边界
+       x0/x1 = 用户定的栏边界（0..1）；cx0/cx1 = 去掉白边后的实际裁切边界 */
+    cols: [{ x0: 0, x1: 1, cx0: 0, cx1: 1, segs: [] }],
     bounds: { x0: 0, x1: 1 },
     items: [],
     unified: { subject: '', source: '', code: '' },
     mode: 'single',
+    vMode: false,      // 竖切模式
     busy: false
   };
 
-  var MIN_SEG = 0.02;   // 单块最小高度（整图比例）
+  var MIN_SEG = 0.02;    // 单块最小高度（整图比例）
+  var MIN_COL = 0.10;    // 单栏最小宽度（整图比例）
   var MAX_SEGS = 30;     // 超过这个数说明切碎了，重切
+
+  var HINT_H = '点页面任意位置横切一刀 · 拖动蓝线调整边界 · 点 × 把这块并到下一块';
+  var HINT_V = '点页面添一条竖线，把一页分成几栏；每栏内部仍按行切。拖动竖线调栏宽，点 × 合并两栏';
 
   /* ================= 图像分析 ================= */
 
@@ -67,8 +75,8 @@
     return { gray: gray, W: W, H: H, hist: hist };
   }
 
-  /* 主分析：找左右内容边界 + 纵向切分 */
-  function analyze(imgEl) {
+  /* 主分析：按当前分栏逐栏找左右内容边界 + 行切点 */
+  function analyzeAll(imgEl) {
     var s = sampling(imgEl, 640);
     var W = s.W, H = s.H, gray = s.gray;
     var T = otsu(s.hist, W * H);
@@ -76,58 +84,90 @@
     T = Math.min(T, 168);
     T = Math.max(T, 70);
 
+    // 全宽列墨迹，用来定每一栏的内容左右边界
     var colInk = new Uint32Array(W);
-    var rowInkAll = new Float32Array(H);
     var y, x, base;
     for (y = 0; y < H; y++) {
       base = y * W;
-      var c = 0;
-      for (x = 0; x < W; x++) {
-        if (gray[base + x] < T) { c++; colInk[x]++; }
-      }
-      rowInkAll[y] = c / W;
+      for (x = 0; x < W; x++) if (gray[base + x] < T) colInk[x]++;
     }
 
-    // 左右边界：列墨迹 > 极少量
     var colTh = Math.max(2, H * 0.004);
-    var xL = 0, xR = W - 1, found = false;
-    for (x = 0; x < W; x++) { if (colInk[x] > colTh) { xL = x; found = true; break; } }
-    for (x = W - 1; x >= 0; x--) { if (colInk[x] > colTh) { xR = x; break; } }
-    if (!found) { xL = 0; xR = W - 1; }
     var padX = Math.round(W * 0.012);
-    xL = Math.max(0, xL - padX);
-    xR = Math.min(W - 1, xR + padX);
 
-    // 只在内容宽度内重算行墨迹（排除页面外的深色桌面）
-    var rowInk = new Float32Array(H);
-    var w = xR - xL + 1;
-    for (y = 0; y < H; y++) {
-      base = y * W;
-      var d2 = 0;
-      for (x = xL; x <= xR; x++) { if (gray[base + x] < T) d2++; }
-      rowInk[y] = d2 / w;
+    // 单栏时顺手判断「这是不是两栏排版」：中间一条竖带几乎没有墨迹，两侧都有
+    B.twoCol = false;
+    if (B.cols.length === 1) {
+      var dens = function (a, b) {
+        var sum = 0;
+        for (var k = a; k <= b; k++) sum += colInk[k];
+        return sum / Math.max(1, (b - a + 1));
+      };
+      var lm = dens(Math.round(W * 0.08), Math.round(W * 0.42));
+      var rm = dens(Math.round(W * 0.58), Math.round(W * 0.92));
+      var mm = dens(Math.round(W * 0.46), Math.round(W * 0.54));
+      B.twoCol = Math.min(lm, rm) > H * 0.02 && mm < Math.min(lm, rm) * 0.25;
     }
 
-    // 页码 / 装订线 / 扫描污点：孤立的小块墨迹会干扰切分，先剔掉
-    dropOrphans(rowInk, H);
+    var out = B.cols.map(function (col) {
+      var px0 = Math.max(0, Math.min(W - 2, Math.round(col.x0 * W)));
+      var px1 = Math.max(px0 + 1, Math.min(W - 1, Math.round(col.x1 * W) - 1));
 
-    // 空白行阈值：正常文字行 5%~30%，空白行≈0
-    var r1 = splitByRows(rowInk, H, 0.008);
-    var segs = r1.segs, dbg = r1.dbg;
+      var xL = px0, xR = px1, found = false;
+      for (x = px0; x <= px1; x++) { if (colInk[x] > colTh) { xL = x; found = true; break; } }
+      for (x = px1; x >= px0; x--) { if (colInk[x] > colTh) { xR = x; break; } }
+      if (!found) { xL = px0; xR = px1; }
+      xL = Math.max(px0, xL - padX);
+      xR = Math.min(px1, xR + padX);
 
-    // 切碎了就收紧一次（提高空白阈值）
-    if (segs.length > MAX_SEGS) {
-      var r2 = splitByRows(rowInk, H, 0.016);
-      segs = r2.segs; dbg = r2.dbg;
+      // 整栏几乎没有墨迹（比如把单栏页硬切成两半）：不产出题目，留着边界可合并回去
+      var inkSum = 0;
+      for (x = px0; x <= px1; x++) inkSum += colInk[x];
+      if (inkSum < H) {
+        return { x0: col.x0, x1: col.x1, cx0: px0 / W, cx1: (px1 + 1) / W, segs: [] };
+      }
+
+      // 只在本栏内容宽度内算行墨迹（排除页面外的深色桌面）
+      var rowInk = new Float32Array(H);
+      var w = xR - xL + 1;
+      for (y = 0; y < H; y++) {
+        base = y * W;
+        var d2 = 0;
+        for (x = xL; x <= xR; x++) { if (gray[base + x] < T) d2++; }
+        rowInk[y] = d2 / w;
+      }
+
+      // 页码 / 装订线 / 扫描污点：孤立的小块墨迹会干扰切分，先剔掉
+      dropOrphans(rowInk, H);
+
+      // 空白行阈值：正常文字行 5%~30%，空白行≈0
+      var r1 = splitByRows(rowInk, H, 0.008);
+      var segs = r1.segs;
+      if (segs.length > MAX_SEGS) segs = splitByRows(rowInk, H, 0.016).segs;
+      if (!segs.length) segs = [{ y0: 0, y1: 1 }];
+      segs = shrinkToContent(segs, rowInk, H, 0.003);
+      if (!segs.length) segs = [{ y0: 0, y1: 1 }];
+
+      return { x0: col.x0, x1: col.x1, cx0: xL / W, cx1: (xR + 1) / W, segs: segs };
+    });
+
+    // 全部栏都是空的（极少见）：兜底给一整块，别让切题区变成空白
+    if (!out.some(function (c) { return c.segs.length; })) {
+      out[0].cx0 = 0; out[0].cx1 = 1; out[0].segs = [{ y0: 0, y1: 1 }];
     }
-    if (!segs.length) segs = [{ y0: 0, y1: 1 }];
-    segs = shrinkToContent(segs, rowInk, H, 0.003);
 
-    return {
-      segs: segs,
-      bounds: { x0: xL / W, x1: (xR + 1) / W },
-      dbg: dbg
-    };
+    B.cols = out;
+    B.bounds = { x0: out[0].cx0, x1: out[out.length - 1].cx1 };
+    return out;
+  }
+
+  /* 兼容旧调用：单栏分析，不改动当前状态 */
+  function analyze(imgEl) {
+    var keepCols = B.cols, keepBounds = B.bounds;
+    B.cols = [{ x0: 0, x1: 1, cx0: 0, cx1: 1, segs: [] }];
+    var r = analyzeAll(imgEl);
+    B.cols = keepCols; B.bounds = keepBounds;
+    return { segs: r[0].segs, bounds: { x0: r[0].cx0, x1: r[0].cx1 } };
   }
 
   /* 剔除孤立墨迹：与上下都有很大间距、自身又很矮的元素（页码、页眉、污点） */
@@ -269,44 +309,91 @@
     };
   }
 
+  /* ================= 结构工具 ================= */
+
+  /* 按阅读顺序展开：先左栏从上到下，再右栏 */
+  function flatSegs() {
+    var out = [];
+    B.cols.forEach(function (col, ci) {
+      col.segs.forEach(function (seg, si) { out.push({ c: ci, i: si, col: col, seg: seg }); });
+    });
+    return out;
+  }
+  function totalSegs() { return flatSegs().length; }
+
+  function colAt(x) {
+    for (var i = 0; i < B.cols.length; i++) {
+      if (x >= B.cols[i].x0 && x < B.cols[i].x1) return B.cols[i];
+    }
+    return B.cols[B.cols.length - 1];
+  }
+
+  function reanalyze() {
+    if (!B.img) return;
+    try { analyzeAll(B.img); } catch (e) { /* 分析失败就保留原切点 */ }
+    renderCrop();
+  }
+
   /* ================= 交互：切题舞台 ================= */
 
   function autoSegment(silent) {
     if (!B.img) return;
     try {
-      var r = analyze(B.img);
-      B.segs = r.segs;
-      B.bounds = r.bounds;
+      analyzeAll(B.img);
       renderCrop();
       if (!silent) {
-        api().toast(B.segs.length > 1
-          ? '自动切成 ' + B.segs.length + ' 题，切错可以调'
-          : '只切出一块。点一下要切的位置就能切；两栏排版建议分左右两次拍');
+        var n = totalSegs();
+        if (n > 1) {
+          api().toast(B.twoCol
+            ? '自动切成 ' + n + ' 题。像是两栏排版，切到「竖切」分栏更准'
+            : '自动切成 ' + n + ' 题，切错可以调');
+        } else {
+          api().toast('只切出一块。点一下要切的位置就能切；两栏排版切到「竖切」先分栏');
+        }
       }
     } catch (e) {
       api().toast('自动切分失败：' + e.message);
-      B.segs = [{ y0: 0, y1: 1 }];
+      B.cols.forEach(function (c) { c.segs = [{ y0: 0, y1: 1 }]; });
       renderCrop();
     }
   }
 
   function renderCrop() {
     var wrap = $('#cropWrap');
-    if (!B.segs.length) { wrap.hidden = true; return; }
+    var all = flatSegs();
+    if (!all.length) { wrap.hidden = true; return; }
     wrap.hidden = false;
-    var n = B.segs.length;
-    $('#cropLayer').innerHTML = B.segs.map(function (s, i) {
-      var top = (s.y0 * 100).toFixed(3);
-      var h = ((s.y1 - s.y0) * 100).toFixed(3);
-      var tiny = (s.y1 - s.y0) < 0.035;
-      return '<div class="crop-seg' + (i === n - 1 ? ' last' : '') + (tiny ? ' tiny' : '') + '" data-i="' + i + '"' +
-        ' style="top:' + top + '%;height:' + h + '%">' +
-        '<span class="no">' + (i + 1) + '</span>' +
-        (n > 1 ? '<button type="button" class="kill" data-kill="' + i + '" aria-label="合并">×</button>' : '') +
-        (i < n - 1 ? '<div class="crop-cut" data-cut="' + i + '" style="top:100%"></div>' : '') +
+
+    var html = all.map(function (f, idx) {
+      var left = (f.col.x0 * 100).toFixed(3);
+      var w = ((f.col.x1 - f.col.x0) * 100).toFixed(3);
+      var top = (f.seg.y0 * 100).toFixed(3);
+      var h = ((f.seg.y1 - f.seg.y0) * 100).toFixed(3);
+      var tiny = (f.seg.y1 - f.seg.y0) < 0.035;
+      var lastInCol = f.i === f.col.segs.length - 1;
+      return '<div class="crop-seg' + (tiny ? ' tiny' : '') + '" data-c="' + f.c + '" data-i="' + f.i + '"' +
+        ' style="left:' + left + '%;width:' + w + '%;top:' + top + '%;height:' + h + '%">' +
+        '<span class="no">' + (idx + 1) + '</span>' +
+        (f.col.segs.length > 1
+          ? '<button type="button" class="kill" data-kill-c="' + f.c + '" data-kill-i="' + f.i + '" aria-label="合并">×</button>'
+          : '') +
+        (lastInCol ? '' : '<div class="crop-cut" data-cut-c="' + f.c + '" data-cut-i="' + f.i + '"></div>') +
         '</div>';
     }).join('');
-    $('#btnToItems').textContent = '下一步：逐题确认（' + n + ' 题）';
+
+    // 栏边界：始终显示，竖切模式下可拖、可合并
+    for (var i = 0; i < B.cols.length - 1; i++) {
+      html += '<div class="crop-vcut' + (B.vMode ? ' act' : '') + '" data-vcut="' + i + '"' +
+        ' style="left:' + (B.cols[i].x1 * 100).toFixed(3) + '%">' +
+        '<span class="vtag">' + (i + 1) + '|' + (i + 2) + '</span>' +
+        '<button type="button" class="vkill" data-vkill="' + i + '" aria-label="合并两栏">×</button>' +
+        '</div>';
+    }
+
+    var layer = $('#cropLayer');
+    layer.innerHTML = html;
+    layer.classList.toggle('vmode', B.vMode);   // 竖切模式下横线不再拦截点击
+    $('#btnToItems').textContent = '下一步：逐题确认（' + all.length + ' 题）';
   }
 
   function relY(clientY) {
@@ -315,12 +402,19 @@
     if (!r.height) return 0;
     return Math.min(1, Math.max(0, (clientY - r.top) / r.height));
   }
+  function relX(clientX) {
+    var inner = $('#cropInner');
+    var r = inner.getBoundingClientRect();
+    if (!r.width) return 0;
+    return Math.min(1, Math.max(0, (clientX - r.left) / r.width));
+  }
 
-  function cutAt(y) {
-    for (var i = 0; i < B.segs.length; i++) {
-      var s = B.segs[i];
+  function cutRowAt(x, y) {
+    var col = colAt(x);
+    for (var i = 0; i < col.segs.length; i++) {
+      var s = col.segs[i];
       if (y > s.y0 + MIN_SEG && y < s.y1 - MIN_SEG) {
-        B.segs.splice(i, 1, { y0: s.y0, y1: y }, { y0: y, y1: s.y1 });
+        col.segs.splice(i, 1, { y0: s.y0, y1: y }, { y0: y, y1: s.y1 });
         renderCrop();
         return true;
       }
@@ -328,60 +422,130 @@
     return false;
   }
 
-  function mergeAt(i) {
-    if (B.segs.length <= 1) return;
-    if (i < B.segs.length - 1) {
-      B.segs[i + 1].y0 = B.segs[i].y0;   // 并到下一块
-      B.segs.splice(i, 1);
+  function cutColAt(x) {
+    for (var i = 0; i < B.cols.length; i++) {
+      var c = B.cols[i];
+      if (x > c.x0 + MIN_COL && x < c.x1 - MIN_COL) {
+        B.cols.splice(i, 1,
+          { x0: c.x0, x1: x, cx0: c.x0, cx1: x, segs: [] },
+          { x0: x, x1: c.x1, cx0: x, cx1: c.x1, segs: [] });
+        reanalyze();     // 两栏各自重新按行切
+        return true;
+      }
+    }
+    return false;
+  }
+
+  function mergeRowAt(ci, i) {
+    var col = B.cols[ci];
+    if (!col || col.segs.length <= 1) return;
+    if (i < col.segs.length - 1) {
+      col.segs[i + 1].y0 = col.segs[i].y0;   // 并到下一块
+      col.segs.splice(i, 1);
     } else {
-      B.segs[i - 1].y1 = B.segs[i].y1;   // 最后一块并到上一块
-      B.segs.splice(i, 1);
+      col.segs[i - 1].y1 = col.segs[i].y1;   // 最后一块并到上一块
+      col.segs.splice(i, 1);
     }
     renderCrop();
+  }
+
+  function mergeColAt(i) {
+    if (B.cols.length <= 1) return;
+    var a = B.cols[i], b = B.cols[i + 1];
+    if (!a || !b) return;
+    B.cols.splice(i, 2, { x0: a.x0, x1: b.x1, cx0: a.cx0, cx1: b.cx1, segs: [] });
+    reanalyze();
   }
 
   function bindCropLayer() {
     var layer = $('#cropLayer');
 
-    // 点击：切分 / 合并
+    // 点击：横切 / 竖切 / 合并
     layer.addEventListener('click', function (e) {
       var kill = e.target.closest('.kill');
       if (kill) {
         e.stopPropagation();
-        mergeAt(+kill.getAttribute('data-kill'));
+        mergeRowAt(+kill.getAttribute('data-kill-c'), +kill.getAttribute('data-kill-i'));
         return;
       }
-      if (e.target.closest('.crop-cut')) return;
-      var y = relY(e.clientY);
-      if (!cutAt(y)) api().toast('离边界太近，换个位置点');
+      var vkill = e.target.closest('.vkill');
+      if (vkill) {
+        e.stopPropagation();
+        mergeColAt(+vkill.getAttribute('data-vkill'));
+        return;
+      }
+      if (e.target.closest('.crop-cut') || e.target.closest('.crop-vcut')) return;
+
+      var x = relX(e.clientX), y = relY(e.clientY);
+      if (B.vMode) {
+        if (!cutColAt(x)) api().toast('离边界太近，换个位置点');
+        return;
+      }
+      if (!cutRowAt(x, y)) api().toast('离边界太近，换个位置点');
     });
 
-    // 拖拽边界
+    // 拖拽：栏边界 / 行边界
     layer.addEventListener('pointerdown', function (e) {
+      var vc = e.target.closest('.crop-vcut');
+      if (vc) {
+        if (!B.vMode) return;            // 横切模式下竖线只做提示，不响应拖动
+        e.preventDefault();
+        e.stopPropagation();
+        var ci = +vc.getAttribute('data-vcut');
+        var A = B.cols[ci], Bc = B.cols[ci + 1];
+        var movedV = false;
+        function onMoveV(ev) {
+          var x = relX(ev.clientX);
+          x = Math.min(Bc.x1 - MIN_COL, Math.max(A.x0 + MIN_COL, x));
+          A.x1 = x; Bc.x0 = x;
+          movedV = true;
+          vc.style.left = (x * 100).toFixed(3) + '%';
+          $$('#cropLayer .crop-seg[data-c="' + ci + '"]').forEach(function (el) {
+            el.style.width = ((A.x1 - A.x0) * 100).toFixed(3) + '%';
+          });
+          $$('#cropLayer .crop-seg[data-c="' + (ci + 1) + '"]').forEach(function (el) {
+            el.style.left = (x * 100).toFixed(3) + '%';
+            el.style.width = ((Bc.x1 - Bc.x0) * 100).toFixed(3) + '%';
+          });
+        }
+        function onUpV() {
+          document.removeEventListener('pointermove', onMoveV);
+          document.removeEventListener('pointerup', onUpV);
+          if (movedV) reanalyze();          // 栏宽变了，重新按行切
+        }
+        document.addEventListener('pointermove', onMoveV);
+        document.addEventListener('pointerup', onUpV);
+        return;
+      }
+
       var cut = e.target.closest('.crop-cut');
       if (!cut) return;
       e.preventDefault();
       e.stopPropagation();
-      var i = +cut.getAttribute('data-cut');
-      var segEls = $$('#cropLayer .crop-seg');
-      var s0 = B.segs[i], s1 = B.segs[i + 1];
-      var moved = false;
+      var ci2 = +cut.getAttribute('data-cut-c');
+      var i2 = +cut.getAttribute('data-cut-i');
+      var col = B.cols[ci2];
+      if (!col) return;
+      var s0 = col.segs[i2], s1 = col.segs[i2 + 1];
+      if (!s0 || !s1) return;
+      var segEls = $$('#cropLayer .crop-seg[data-c="' + ci2 + '"]');
+      var moved2 = false;
 
       function onMove(ev) {
         var y = relY(ev.clientY);
         y = Math.min(s1.y1 - MIN_SEG, Math.max(s0.y0 + MIN_SEG, y));
         s0.y1 = y; s1.y0 = y;
-        moved = true;
-        if (segEls[i]) segEls[i].style.height = ((s0.y1 - s0.y0) * 100).toFixed(3) + '%';
-        if (segEls[i + 1]) {
-          segEls[i + 1].style.top = (y * 100).toFixed(3) + '%';
-          segEls[i + 1].style.height = ((s1.y1 - y) * 100).toFixed(3) + '%';
+        moved2 = true;
+        if (segEls[i2]) segEls[i2].style.height = ((s0.y1 - s0.y0) * 100).toFixed(3) + '%';
+        if (segEls[i2 + 1]) {
+          segEls[i2 + 1].style.top = (y * 100).toFixed(3) + '%';
+          segEls[i2 + 1].style.height = ((s1.y1 - y) * 100).toFixed(3) + '%';
         }
       }
       function onUp() {
         document.removeEventListener('pointermove', onMove);
         document.removeEventListener('pointerup', onUp);
-        if (moved) renderCrop();
+        if (moved2) renderCrop();
       }
       document.addEventListener('pointermove', onMove);
       document.addEventListener('pointerup', onUp);
@@ -390,16 +554,19 @@
 
   /* ================= 裁剪出单题图 ================= */
 
-  function cropSeg(seg, maxW, quality) {
+  function cropOne(col, seg, maxW, quality) {
     return new Promise(function (resolve, reject) {
       try {
         var img = B.img;
         var iw = img.naturalWidth, ih = img.naturalHeight;
-        var x0 = Math.round(iw * B.bounds.x0);
-        var x1 = Math.round(iw * B.bounds.x1);
+        var x0 = Math.round(iw * col.cx0);
+        var x1 = Math.round(iw * col.cx1);
         var y0 = Math.round(ih * seg.y0);
         var y1 = Math.round(ih * seg.y1);
         var padY = Math.round((y1 - y0) * 0.05);
+        var padX = Math.round((x1 - x0) * 0.03);
+        x0 = Math.max(0, x0 - padX);
+        x1 = Math.min(iw, x1 + padX);
         y0 = Math.max(0, y0 - padY);
         y1 = Math.min(ih, y1 + padY);
         var cw = Math.max(1, x1 - x0), ch = Math.max(1, y1 - y0);
@@ -419,28 +586,34 @@
   /* ================= 批量确认区 ================= */
 
   function toItems() {
-    if (!B.segs.length) return;
+    var all = flatSegs();
+    if (!all.length) return;
     if (B.busy) return;
     B.busy = true;
     $('#btnToItems').disabled = true;
     $('#btnToItems').textContent = '正在裁剪…';
-    var jobs = B.segs.map(function (s) { return cropSeg(s, 1200, 0.82); });
+
+    var prev = B.items;                    // AI 切题预填的字段，数目对得上就沿用
+    var keepPrev = prev.length === all.length;
+
+    var jobs = all.map(function (f) { return cropOne(f.col, f.seg, 1200, 0.82); });
     Promise.all(jobs).then(function (imgs) {
-      var hts = B.segs.map(function (s) { return s.y1 - s.y0; }).sort(function (a, b) { return a - b; });
+      var hts = all.map(function (f) { return f.seg.y1 - f.seg.y0; }).sort(function (a, b) { return a - b; });
       var medH = hts[Math.floor(hts.length / 2)] || 0;
       B.items = imgs.map(function (src, i) {
-        var h = B.segs[i].y1 - B.segs[i].y0;
+        var h = all[i].seg.y1 - all[i].seg.y0;
+        var old = keepPrev ? prev[i] : null;
         return {
           tiny: medH > 0 && h < medH * 0.6,
           key: 'b' + i + '_' + Date.now().toString(36),
           img: src,
-          subject: B.unified.subject || guessSubject(),
-          knowledge: '',
-          code: B.unified.code || '',
-          difficulty: 2,
-          source: B.unified.source || '',
-          stem: '',
-          note: ''
+          subject: (old && old.subject) || B.unified.subject || guessSubject(),
+          knowledge: (old && old.knowledge) || '',
+          code: (old && old.code) || B.unified.code || '',
+          difficulty: (old && old.difficulty) || 2,
+          source: (old && old.source) || B.unified.source || '',
+          stem: (old && old.stem) || '',
+          note: (old && old.note) || ''
         };
       });
       renderItems();
@@ -454,16 +627,30 @@
     }).then(function () {
       B.busy = false;
       $('#btnToItems').disabled = false;
-      // 已经进入确认区的话，不要再把切题区显示回来
       if ($('#batchItems').hidden) renderCrop();
     });
   }
 
+  /* 没指定过学科时：优先用录题页里选的那个，其次上一道题，最后第一科 */
   function guessSubject() {
-    var qs = api().S.questions || [];
+    var S = api().S;
+    if (S.pending && S.pending.subject) return S.pending.subject;
+    var qs = S.questions || [];
     var last = qs[qs.length - 1];
-    if (last && api().S.subjects.indexOf(last.subject) >= 0) return last.subject;
-    return api().S.subjects[0] || '数学';
+    if (last && S.subjects.indexOf(last.subject) >= 0) return last.subject;
+    return S.subjects[0] || '数学';
+  }
+
+  /* 拍照前选过学科，就带进整页切题；没选过则留空让 AI / 上一题兜底
+     force = 一换新图就按当前所选学科重来（「拍照前选了」优先于上次的统一设置） */
+  function seedSubject(force) {
+    var pend = api().S.pending && api().S.pending.subject;
+    if (force) {
+      if (pend) B.unified.subject = pend;
+      return;
+    }
+    if (B.unified.subject) return;
+    if (pend) B.unified.subject = pend;
   }
 
   function subjectOptions(cur) {
@@ -681,6 +868,7 @@
     var btn = $('#btnAiSeg');
     btn.disabled = true;
     btn.textContent = '识别中…';
+    var hadCols = B.cols.length > 1;
     api().aiChat([
       { role: 'user', content: [{ type: 'text', text: PROMPT_SEG }, api().imagePart(B.src)] }
     ], 2000).then(function (txt) {
@@ -690,25 +878,31 @@
         .filter(function (x) { return typeof x.y0 === 'number' && typeof x.y1 === 'number' && x.y1 > x.y0; })
         .sort(function (a, b) { return a.y0 - b.y0; });
       if (!items.length) throw new Error('返回的位置信息不完整');
-      B.segs = items.map(function (x) {
+
+      // AI 只按整页纵切，先回到单栏，复用单栏的左右内容边界
+      B.cols = [{ x0: 0, x1: 1, cx0: 0, cx1: 1, segs: [] }];
+      try { analyzeAll(B.img); } catch (e) { /* 忽略：cx 用默认整宽 */ }
+      B.cols[0].segs = items.map(function (x) {
         return { y0: Math.max(0, x.y0), y1: Math.min(1, x.y1) };
       });
+      B.bounds = { x0: B.cols[0].cx0, x1: B.cols[0].cx1 };
       renderCrop();
-      // 预先带回识别到的字段
+
+      // 预先带回识别到的字段；拍照前选过学科时以用户为准
       B.items = items.map(function (x, i) {
         return {
           key: 'a' + i,
           img: '',
-          subject: api().S.subjects.indexOf(x.subject) >= 0 ? x.subject : (B.unified.subject || api().S.subjects[0]),
+          subject: B.unified.subject || (api().S.subjects.indexOf(x.subject) >= 0 ? x.subject : guessSubject()),
           knowledge: x.knowledge || '',
-          code: x.errorCode || '',
+          code: x.code || x.errorCode || '',
           difficulty: x.difficulty || 2,
           source: B.unified.source || '',
           stem: x.stem || '',
           note: ''
         };
       });
-      api().toast('AI 切出 ' + B.segs.length + ' 题，请核对');
+      api().toast((hadCols ? 'AI 按单栏重切了 ' : 'AI 切出 ') + B.cols[0].segs.length + ' 题，请核对');
     }).catch(function (e) {
       api().toast('AI 切题失败：' + e.message);
     }).then(function () {
@@ -717,16 +911,32 @@
     });
   }
 
+  /* ================= 切法切换 ================= */
+
+  function setSegMode(m) {
+    B.vMode = m === 'v';
+    $$('#segSwitch button').forEach(function (b) {
+      b.classList.toggle('on', b.getAttribute('data-seg') === m);
+    });
+    var hint = $('#cropHint');
+    if (hint) hint.textContent = B.vMode ? HINT_V : HINT_H;
+    if ($('#cropLayer') && totalSegs()) renderCrop();
+  }
+
   /* ================= 上传与流程 ================= */
 
   function handleFile(f) {
     if (!f) return;
     api().toast('处理整页图…', 1200);
+    seedSubject(true);
     api().compressImage(f, 2000, 0.88).then(function (dataUrl) {
       B.src = dataUrl;
       var img = new Image();
       img.onload = function () {
         B.img = img;
+        B.cols = [{ x0: 0, x1: 1, cx0: 0, cx1: 1, segs: [] }];
+        B.bounds = { x0: 0, x1: 1 };
+        setSegMode('h');
         $('#bEmpty').hidden = true;
         $('#bPreview').hidden = true;
         $('#bUploader').hidden = true;
@@ -746,9 +956,11 @@
   function resetBatch() {
     B.src = '';
     B.img = null;
-    B.segs = [];
+    B.cols = [{ x0: 0, x1: 1, cx0: 0, cx1: 1, segs: [] }];
+    B.bounds = { x0: 0, x1: 1 };
     B.items = [];
     B.unified = { subject: '', source: '', code: '' };
+    B.vMode = false;
     $('#bEmpty').hidden = false;
     $('#bPreview').hidden = true;
     $('#bUploader').hidden = false;
@@ -769,6 +981,7 @@
     $('#singleWrap').hidden = m !== 'single';
     $('#batchWrap').hidden = m !== 'batch';
     if (m === 'batch') {
+      seedSubject();                    // 拍照前选的学科，带进整页切题
       $('#btnAiSeg').disabled = !api() || !api().aiReady();
     }
   }
@@ -785,6 +998,11 @@
     $('#bDrop').addEventListener('click', function () { resetBatch(); api().toast('已移除'); });
     $('#bFile').addEventListener('change', function (e) { handleFile(e.target.files && e.target.files[0]); });
     $('#bCam').addEventListener('change', function (e) { handleFile(e.target.files && e.target.files[0]); });
+
+    $('#segSwitch').addEventListener('click', function (e) {
+      var b = e.target.closest('[data-seg]');
+      if (b) setSegMode(b.getAttribute('data-seg'));
+    });
 
     $('#btnAutoSeg').addEventListener('click', function () {
       if (!B.img) return;
@@ -826,12 +1044,21 @@
 
   function init() {
     if (!document.getElementById('batchWrap')) return;
+    // 兼容旧接口：state.segs / state.bounds 仍指向第一栏
+    Object.defineProperty(B, 'segs', {
+      get: function () { return (B.cols[0] && B.cols[0].segs) || []; },
+      set: function (v) {
+        B.cols = [{ x0: 0, x1: 1, cx0: 0, cx1: 1, segs: v || [] }];
+        B.bounds = { x0: 0, x1: 1 };
+      }
+    });
     bind();
     window.CTB_BATCH = {
       state: B,
       open: function () { setMode('batch'); },
       autoSegment: autoSegment,
-      analyze: analyze
+      analyze: analyze,
+      segMode: setSegMode
     };
   }
 
